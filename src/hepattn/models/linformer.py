@@ -77,9 +77,29 @@ class LinformerAttention(nn.Module):
         # attention
         dots = torch.einsum('bhnd,bhkd->bhnk', queries, keys) * (d_h ** -0.5)
         if attn_mask is not None:
-            dots[..., :kv_len].masked_fill((attn_mask == 0)[:, None, ...], float("-inf"))
-            dots[..., kv_len:] = float("-inf") # mask out anything past the current seq_len too.
-        attn = dots.softmax(dim=-1)
+            # Build mask in projected dots space.
+            mask = torch.zeros_like(dots, dtype=torch.bool)
+
+            original_mask = (attn_mask == 0)[:, None, ...]
+            mask[..., :kv_len] = original_mask
+            mask[..., kv_len:] = True
+
+            # Rows where every position is masked.
+            fully_masked = mask.all(dim=-1, keepdim=True)
+
+            # Apply normal -inf masking.
+            dots = dots.masked_fill(mask, float("-inf"))
+
+            # Avoid softmax([-inf, -inf, ...]) = NaN.
+            dots_for_softmax = torch.where(fully_masked, torch.zeros_like(dots), dots,)
+
+            attn = dots_for_softmax.softmax(dim=-1)
+
+            # Fully masked rows should attend to nothing.
+            attn = torch.where(fully_masked, torch.zeros_like(attn),attn,)
+        else:
+            attn = dots.softmax(dim=-1)
+
         attn = self.dropout(attn)
         
         out = torch.einsum('bhnk,bhkd->bhnd', attn, values)
