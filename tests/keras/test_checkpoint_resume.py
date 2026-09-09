@@ -126,7 +126,9 @@ def test_lightning_checkpoint_round_trip(tmp_path):
     module.model.eval()
     with torch.no_grad():
         before = module.model(inputs)
-        ebops_before = float(module.model.quant_losses())
+        # ModelWrapper.model widens to `Tensor | Module` through nn.Module.__getattr__, so ty
+        # cannot see KerasMaskFormer's own methods on it. Runtime type is unaffected.
+        ebops_before = float(module.model.quant_losses())  # ty: ignore [call-non-callable]
     weights_before, quant_before = probe_values(module), quantizer_values(module)
 
     restored = make_module(999)
@@ -142,13 +144,14 @@ def test_lightning_checkpoint_round_trip(tmp_path):
     assert all(torch.equal(quant_before[p], after_quant[p]) for p in quant_before), "quantizer state not restored"
 
     opt_state = saved["optimizer_states"][0]
-    assert sum(len(g["params"]) for g in opt_state["param_groups"]) == sum(len(g) for g in module.model.trainable_parameter_groups())
+    groups = module.model.trainable_parameter_groups()  # ty: ignore [call-non-callable]
+    assert sum(len(g["params"]) for g in opt_state["param_groups"]) == sum(len(g) for g in groups)
     assert saved["lr_schedulers"], "no LR scheduler state saved"
 
     restored.model.eval()
     with torch.no_grad():
         after = restored.model(inputs)
-        ebops_after = float(restored.model.quant_losses())
+        ebops_after = float(restored.model.quant_losses())  # ty: ignore [call-non-callable]
     assert ebops_before == ebops_after, f"EBOPs differ after restore: {ebops_before} vs {ebops_after}"
     worst = _max_delta(before, after)
     assert worst == 0.0, f"restored model outputs differ, max |delta| = {worst}"
