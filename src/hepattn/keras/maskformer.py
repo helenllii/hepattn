@@ -142,3 +142,87 @@ class KerasMaskFormer(MaskFormer):
                 if getattr(var, "trainable", True):
                     add(var.value, var.path)
         return decay, quant
+
+    def keras_variables(self):
+        """Yield every keras Variable owned by the model exactly once (trainable or not).
+
+        `Layer.variables` is recursive and includes seed/metric state, so it also reaches
+        sublayers that keras tracks in plain lists rather than as torch submodules.
+        """
+        seen: set[int] = set()
+        for layer in self.keras_layers():
+            for var in layer.variables:
+                if id(var) not in seen:
+                    seen.add(id(var))
+                    yield var
+
+    @torch.no_grad()
+    def move_keras_variables_to(self, device: torch.device | str) -> int:
+        """Move every already-materialized keras Variable onto ``device``. Returns the number moved.
+
+        `nn.Module.to()` -- and therefore Lightning's device migration -- reaches only the
+        variables a layer registered in its `_torch_params`, and an HGQ2 layer registers
+        none of its own (see register_keras_parameters). Measured on Polaris, `.to(cuda)`
+        left 684 of the CLIC model's keras Variables behind on cpu -- the own weights
+        (kernel, bias, beta, ebops) of the layers that were built directly. On a single
+        device nothing fails visibly, because keras' `convert_to_tensor` copies each
+        stranded tensor to the GPU on every single op; under DDP it aborts the run.
+
+        `set_keras_default_device()` is not an alternative: it only chooses where keras
+        creates FUTURE tensors. Both are needed, and MPflowHGQ._sync_keras_device does both.
+
+        The move is an in-place `.data` swap on the existing `nn.Parameter`, so parameter
+        object identity -- and hence any optimizer already holding a reference -- survives,
+        and the Variable is never replaced by a detached tensor. That also keeps a
+        registered variable aliased to its `_torch_params` entry, so `named_parameters()`
+        and `state_dict()` keep exposing the tensors the forward pass actually reads.
+        """
+        target = torch.empty(0, device=device).device
+        moved = 0
+        for var in self.keras_variables():
+            value = getattr(var, "_value", None)
+            if value is None or value.device == target:
+                continue  # never built, or already there
+            value.data = value.data.to(target)
+            if value.grad is not None:
+                value.grad = value.grad.to(target)
+            moved += 1
+        return moved
+
+    def register_keras_parameters(self) -> int:
+        """Register every keras layer's weights on the torch module tree. Returns layers newly tracked.
+
+        MUST be called once after the lazy layers are materialized, before anything saves a
+        checkpoint. `MPflowHGQ.setup` does it; a driver that materializes the model itself
+        has to as well.
+
+        A keras layer publishes its weights to torch by building
+        `layer._torch_params = ParameterDict({var.path: var.value})` from `_post_build()`.
+        `hgq.layers.core.base.QLayerBase._post_build` OVERRIDES that hook with assertions
+        of its own and never calls `super()._post_build()`, so no HGQ2 layer ever tracks
+        its weights -- not via `layer.build(shape)`, and not via `layer(x)` either
+        (keras' `build_wrapper` calls `_post_build` on both paths; it is the override, not
+        the call path, that breaks it). None of the QDense kernel/bias tensors therefore
+        reach `state_dict()`, and a checkpoint carries the quantizer state and the norms
+        but none of the network they belong to.
+
+        Keras recovers lazily: `TorchLayer.torch_params`, `.parameters()` and
+        `.named_parameters()` all call `_track_variables()` if the dict is missing. That is
+        the second half of the problem -- whether a checkpoint is complete depends on
+        whether something happened to traverse submodule `.parameters()` first, so the key
+        set is a function of the callback list. Doing it here, once, at a defined point,
+        makes the state_dict deterministic and complete; afterwards those lazy paths are
+        no-ops. `torch_params` is keras' own public accessor for this, and the tracking it
+        performs reuses the existing `nn.Parameter` objects, so no tensor is copied and
+        nothing the optimizer already references is replaced.
+        """
+        tracked = 0
+        for module in self.modules():
+            if isinstance(module, keras.layers.Layer) and getattr(module, "_torch_params", None) is None:
+                _ = module.torch_params
+                tracked += 1
+        return tracked
+
+    def missing_state_keys(self, state: dict) -> list[str]:
+        """Keys this model needs that ``state`` does not carry (checkpoint completeness check)."""
+        return sorted(set(self.state_dict().keys()) - set(state.keys()))

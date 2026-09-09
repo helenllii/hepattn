@@ -23,7 +23,13 @@ class MPflowHGQ(MPflow):
       created and before checkpoint state is restored (HGQ2 layers size their
       bitwidth variables from the first real batch's static shapes),
     - a quantizer parameter group without weight decay (decaying learned bitwidths
-      would silently shrink precision), with the non-trainable beta excluded.
+      would silently shrink precision), with the non-trainable beta excluded,
+    - registration of the keras weights on the torch module tree, without which they
+      are absent from state_dict() and therefore from every checkpoint
+      (see KerasMaskFormer.register_keras_parameters),
+    - migration of already-materialized keras Variables onto Lightning's device, which
+      nn.Module.to() cannot do for the ones no layer registered
+      (see KerasMaskFormer.move_keras_variables_to).
     """
 
     def setup(self, stage: str) -> None:
@@ -43,6 +49,13 @@ class MPflowHGQ(MPflow):
         # take the device from the strategy, which setup_environment() has already resolved.
         set_keras_default_device(self._target_device())
         self._materialize_keras_layers(stage)
+        # Every lazy keras Variable now exists. Publish them to the torch module tree here,
+        # before anything can save a checkpoint or introspect the module: HGQ2 layers never
+        # do it themselves, and keras' lazy recovery would otherwise make the state_dict key
+        # set depend on whether something happened to traverse submodule .parameters(). It
+        # also has to precede on_load_checkpoint(), which checks a restored state against
+        # exactly the key set this call fixes.
+        self.model.register_keras_parameters()
 
     def _target_device(self) -> str:
         strategy = getattr(self.trainer, "strategy", None)
@@ -50,10 +63,19 @@ class MPflowHGQ(MPflow):
         return str(root) if root is not None else str(self.device)
 
     def _sync_keras_device(self) -> None:
-        # setup() now builds on the strategy's root device, so this is normally a no-op.
+        # Two distinct things have to follow Lightning's device:
+        # 1. where keras creates NEW tensors -- quantizer internals (STE rounding, LUT
+        #    domains) otherwise mix cpu constants with cuda activations;
+        # 2. where the ALREADY-materialized keras Variables live. set_keras_default_device
+        #    does not touch those, and nn.Module.to() only reaches the ones a layer
+        #    registered on the torch module tree.
+        #
+        # setup() now builds on the strategy's root device, so both are normally no-ops.
         # Kept because self.device is authoritative once Lightning has moved the module, and
-        # because test/predict can run without a fit having gone through setup() first.
+        # because test/predict can run without a fit having gone through setup() first --
+        # in which case the Variables really are somewhere else and have to be migrated.
         set_keras_default_device(str(self.device))
+        self.model.move_keras_variables_to(self.device)
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -85,6 +107,34 @@ class MPflowHGQ(MPflow):
             self.model(inputs)
         self.model.train(was_training)
 
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Refuse a checkpoint that predates the keras-weight registration fix.
+
+        Such a checkpoint carries the quantizer state, the norms and the optimizer moments
+        but none of the network's kernels, so Lightning would restore it onto freshly
+        initialized weights and report a successful resume. Fail here, with the reason,
+        rather than let strict=True print thousands of missing keys or -- worse -- let a
+        non-strict load through.
+
+        Runs after setup(), so register_keras_parameters() has already fixed the key set
+        this compares against.
+
+        Raises:
+            RuntimeError: If the checkpoint does not carry every key the model expects.
+        """
+        state = checkpoint.get("state_dict")
+        if state is None:
+            return
+        missing = self.model.missing_state_keys({k.removeprefix("model."): v for k, v in state.items()})
+        if missing:
+            raise RuntimeError(
+                f"this checkpoint is missing {len(missing)} of the model's state keys, including "
+                f"{sum(1 for k in missing if k.endswith(('/kernel', '/bias')))} keras kernel/bias tensors "
+                f"(e.g. {missing[:3]}). It was written before KerasMaskFormer.register_keras_parameters "
+                "existed, so it does not contain the trained network weights and cannot be resumed "
+                "faithfully -- only its quantizer state and norms are recoverable."
+            )
+
     def aggregate_losses(self, losses: dict[str, dict[str, dict[str, Tensor]]], stage: str | None = None) -> Tensor:
         total_loss = super().aggregate_losses(losses, stage=stage)
         quant_loss = self.model.quant_losses()
@@ -104,6 +154,11 @@ class MPflowHGQ(MPflow):
         # the nn.Module, so that list omits every Dense kernel in the model. See
         # KerasMaskFormer.trainable_parameter_groups.
         decay_params, quantizer_params = self.model.trainable_parameter_groups()
+
+        # A tensor in two groups would take its update twice, with two weight decays.
+        # Cheap, and the two groups are built from overlapping traversals.
+        ids = [id(p) for p in decay_params + quantizer_params]
+        assert len(ids) == len(set(ids)), "duplicate parameter objects across optimizer groups"
 
         param_groups = [{"params": decay_params}, {"params": quantizer_params, "weight_decay": 0.0}]
         opt = optimizer(param_groups, lr=self.lrs_config["initial"], weight_decay=self.lrs_config["weight_decay"])
