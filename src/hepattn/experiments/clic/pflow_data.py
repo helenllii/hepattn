@@ -764,6 +764,8 @@ class PflowDataModule(L.LightningDataModule):
         test_path: str | None = None,
         pin_memory: bool = True,
         test_suff: str | None = None,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -778,6 +780,11 @@ class PflowDataModule(L.LightningDataModule):
         self.num_test = num_test
         self.pin_memory = pin_memory
         self.test_suff = test_suff
+        # Both default to the DataLoader's own defaults, so an existing config is unaffected.
+        # They are named explicitly rather than left to **kwargs because kwargs is forwarded to
+        # CLICDataset, which would reject them.
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.scale_dict_path = scale_dict_path
         self.kwargs = kwargs
 
@@ -827,6 +834,14 @@ class PflowDataModule(L.LightningDataModule):
 
     def get_dataloader(self, stage: str, dataset: CLICDataset, shuffle: bool):
         print(f"Creating {stage} dataloader with {len(dataset):,} events")
+        # persistent_workers and prefetch_factor are only legal with worker processes: torch
+        # raises for either of them when num_workers == 0, so they are passed only when they
+        # apply and are otherwise left at the DataLoader's defaults.
+        extra: dict = {}
+        if self.num_workers > 0:
+            extra["persistent_workers"] = self.persistent_workers
+            if self.prefetch_factor is not None:
+                extra["prefetch_factor"] = self.prefetch_factor
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size,
@@ -835,6 +850,7 @@ class PflowDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
             shuffle=shuffle,
             pin_memory=self.pin_memory,
+            **extra,
         )
 
     def train_dataloader(self):

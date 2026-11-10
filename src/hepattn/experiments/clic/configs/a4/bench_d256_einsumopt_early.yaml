@@ -1,0 +1,120 @@
+# SHORT TRAINING-THROUGHPUT BENCHMARK: full-size (dim 256) PHAT16 + GMP, EinsumOpt, early arm.
+#
+# This is the production dim-256 PHAT+GMP architecture, run through the real training loop for a
+# few hundred steps to measure speed. It is NOT a training recipe: validation, checkpointing and
+# the prediction writer are all off, and `ThroughputBenchmark` stops the run after its window.
+#
+# Overlay on configs/base.yaml (main.py's implicit default_config_files), which already supplies
+# dim 256, 6 encoder layers, 16 heads, the decoder, num_queries, task heads, matcher and losses.
+#
+# THREE changes to the model, and nothing else:
+#   1. class_path -> hepattn.experiments.clic.a4.PlacementEncoder  (production Encoder cannot
+#      select which layers carry GMP)
+#   2. gmp_impl: einsumopt   (the validated GMPEinsumOpt forward; see a4/gmp_impl.py)
+#   3. gmp_layers: [0]       (GMP kept ONLY in layer 0 -- the "early" placement arm; the other
+#                             five layers keep patch attention with the GMP module removed)
+#
+# Compose with the machine config and run from src/hepattn/experiments/clic:
+#   python main.py fit -c configs/a4/bench_d256_einsumopt_early.yaml -c configs/a4/polaris.yaml
+#
+# EFFECTIVE GLOBAL BATCH IS PINNED AT 2048 (= 128 x 1 device x 16 accumulate), the value the
+# dim-256 arms train at. `expect_global_batch` below makes the run FAIL rather than silently
+# benchmark a different optimization problem, because the 1-GPU vs N-GPU comparison is only a
+# throughput comparison at fixed global batch: with 4 devices you must pass
+# --trainer.accumulate_grad_batches=4, not leave it at 16.
+name: clic_a4_bench_d256_einsumopt_early
+
+trainer:
+  # 400 stays, so the step cost measured here is the step cost of the real run. The benchmark is
+  # bounded by ThroughputBenchmark, never by max_epochs: lowering max_epochs would change
+  # OneCycleLR's total_steps (Lightning derives it from max_epochs, num_training_batches and
+  # accumulate_grad_batches) and so would measure a different schedule's steps.
+  max_epochs: 400
+  precision: bf16-mixed
+  gradient_clip_val: 0.1
+
+  # A throughput benchmark must not pay for, or be interrupted by, anything but training.
+  enable_checkpointing: false
+  limit_val_batches: 0
+  num_sanity_val_steps: 0
+
+  # Comet is unreachable from a compute node without credentials, and an offline archive is dead
+  # weight here. CSVLogger is used rather than `false` because the CLI links --name to
+  # trainer.logger.init_args.name, and CSVLogger accepts a `name`.
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: logs
+
+  # The whole list is repeated because a list overlay REPLACES rather than merges. Dropped from
+  # base.yaml: Checkpoint (writes ~98 MiB/epoch), InferenceTimer, SaveConfig,
+  # PflowPredictionWriter -- none of them are part of the training step being measured.
+  callbacks:
+    - class_path: hepattn.callbacks.Compile
+    - class_path: lightning.pytorch.callbacks.ModelSummary
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 50
+    - class_path: hepattn.experiments.clic.a4.bench_callback.ThroughputBenchmark
+      init_args:
+        # Warmup must outlast torch.compile and the dataloader worker spin-up. Both are tens of
+        # seconds on the first steps, and tqdm's displayed rate is a cumulative average that
+        # never recovers from them -- which is exactly why this callback exists.
+        warmup_steps: 50
+        measure_steps: 150
+        # Measured from the real dim-256 runs: "Created training dataset with 994,376 events",
+        # 7769 steps/epoch at batch 128. Given explicitly so a benchmark over a truncated
+        # dataset (data.num_train below) still extrapolates to the real epoch.
+        full_train_events: 994376
+        expect_global_batch: 2048
+        tag: d256-einsumopt-early
+
+data:
+  batch_size: 128
+  # Enough for 200 steps x 128 events x 4 ranks, with margin: under DDP each rank sees
+  # num_train/world_size events, so a subset sized for 1 GPU would starve a 4-GPU run.
+  # Truncated only to keep dataset construction short -- pflow_data reads the whole selection
+  # into memory at __init__, and the full file is ~1M events.
+  num_train: 150000
+  num_val: 1024
+
+model:
+  model:
+    init_args:
+      encoder:
+        class_path: hepattn.experiments.clic.a4.PlacementEncoder
+        init_args:
+          gmp_impl: einsumopt
+          gmp_layers: [0]
+          num_layers: 6
+          dim: 256
+          attn_type: patch        # CHANGED (base: flash-varlen)
+          patch_size: 16          # CHANGED (base: null) -- PHAT16
+          gmp:                    # CHANGED (base: null) -- geometric message passing
+            kernel_size: 3
+            eta_cell: 0.2
+            phi_cells: 32
+            eta_max: 5.2
+          window_size: null
+          window_wrap: false
+          score_mod: null
+          value_residual: true
+          num_register_tokens: 8
+          patch_global: true
+          attn_kwargs:
+            num_heads: 16
+          norm: FastLayerNorm
+          layer_scale: null
+          drop_path: 0.0
+          qkv_norm: false
+          hybrid_norm: true
+          dense_norm_placement: legacy
+          dense_kwargs:
+            activation: SwiGLU
+      # CHANGED (base: all null). PHAT needs the periodic phi sort and GMP needs the calorimeter
+      # coordinates; these are part of the encoder swap, not a scale change.
+      input_sort_field: phi_calo
+      input_sort_period: 6.283185307179586
+      input_coord_fields:
+        - eta_calo
+        - phi_calo

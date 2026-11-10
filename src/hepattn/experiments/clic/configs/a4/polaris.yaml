@@ -1,0 +1,41 @@
+# Polaris (ALCF) machine settings. Model-independent: it sets device/host layout only.
+#
+# HARDWARE, and why these numbers:
+#   1 node = 4x A100 SXM 40GB + 1x AMD EPYC Milan 7543P (32 physical cores) + 512 GB host RAM.
+#   So a node gives 8 cores per GPU. On the Falcon A100-80GB a single-GPU job was given all 32
+#   cores, and that job was measured to be HOST-bound, not GPU-bound (4x the model width cost
+#   only 1.5x the epoch; three concurrent jobs on one GPU each kept full speed). Per-GPU
+#   throughput can therefore REGRESS here even though the GPU is the same class, and the win has
+#   to come from using all four. That is what submit_bench_polaris.sh measures.
+#
+# MEMORY: 40 GB per card, against 80 GB on Falcon. The dim-256 PHAT+GMP arms were measured at
+# ~7.5 GiB peak for micro-batch 128 on the 80 GB card (job 61930), so micro-batch 128 is expected
+# to fit with wide margin -- but that figure came from `nvidia-smi` on a shared MPS device, not
+# from a per-process peak, so the benchmark reports torch's own max_memory_reserved and that is
+# the number to trust before committing to a batch size here.
+#
+# NO DATA PATHS ARE SET HERE on purpose. base.yaml's defaults point at this site's
+# /projects/u5ar/data/clic; submit_bench_polaris.sh passes --data.train_path/--data.valid_path
+# explicitly from $CLIC_DATA so a wrong path fails immediately instead of being inherited.
+trainer:
+  accelerator: gpu
+  # Overridden per phase by the launcher. accumulate_grad_batches must be divided by the device
+  # count to hold the effective global batch at 2048: 1 GPU -> 16, 2 -> 8, 4 -> 4. The benchmark
+  # callback's `expect_global_batch` enforces this.
+  devices: 1
+  num_nodes: 1
+  accumulate_grad_batches: 16
+  # "auto" picks DDP for devices > 1, and Lightning subprocess-launches the ranks, so a
+  # single-node multi-GPU run needs no mpiexec rank plumbing. Multi-node would.
+  strategy: auto
+
+data:
+  # 8 = 32 cores / 4 GPUs, the per-GPU share when a whole node is in use. The launcher raises it
+  # for the single-GPU phases, which have the whole socket to themselves.
+  num_workers: 8
+  pin_memory: true
+  # Falcon's runs left this at the DataLoader default (False), so all workers were torn down and
+  # re-forked every epoch over a dataset that pflow_data holds entirely in memory. Enabled here
+  # as a measurement, not an assumption: the launcher runs one phase with it off.
+  persistent_workers: true
+  prefetch_factor: 4
