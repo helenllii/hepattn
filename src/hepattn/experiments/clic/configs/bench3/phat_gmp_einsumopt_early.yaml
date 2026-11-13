@@ -1,0 +1,45 @@
+# bench3 arm 3: PHAT16 + GMP, EinsumOpt GMP forward, GMP in encoder layer 0 only ("early" placement).
+#
+# The `model:` block is copied verbatim from configs/a4/bench_d256_einsumopt_early.yaml (the validated A4 arm), and
+# NOTHING else from that file: its trainer/data/callback settings are replaced by configs/bench3/common.yaml so all
+# three arms share one training setup. tests/experiments/clic/test_bench3.py pins that the two model blocks agree.
+name: bench3_phat_gmp_einsumopt_early
+
+model:
+  model:
+    init_args:
+      encoder:
+        class_path: hepattn.experiments.clic.a4.PlacementEncoder
+        init_args:
+          gmp_impl: einsumopt
+          gmp_layers: [0]
+          num_layers: 6
+          dim: 256
+          attn_type: patch
+          patch_size: 16
+          gmp:
+            kernel_size: 3
+            eta_cell: 0.2
+            phi_cells: 32
+            eta_max: 5.2
+          window_size: null
+          window_wrap: false
+          score_mod: null
+          value_residual: true
+          num_register_tokens: 8
+          patch_global: true
+          attn_kwargs:
+            num_heads: 16
+          norm: FastLayerNorm
+          layer_scale: null
+          drop_path: 0.0
+          qkv_norm: false
+          hybrid_norm: true
+          dense_norm_placement: legacy
+          dense_kwargs:
+            activation: SwiGLU
+      input_sort_field: phi_calo
+      input_sort_period: 6.283185307179586
+      input_coord_fields:
+        - eta_calo
+        - phi_calo

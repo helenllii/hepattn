@@ -1,0 +1,38 @@
+# bench3 arm: PHAT16 without GMP: the same PlacementEncoder and encoder block as every PHAT arm, with gmp unset (gmp_layers
+# and gmp_impl at their no-op defaults) and no GMP coordinates (the Encoder rejects coordinates without gmp).
+#
+# Generated from configs/bench3/phat_gmp_einsumopt_early.yaml: the encoder block is identical except the GMP keys
+# (gmp, gmp_layers, gmp_impl, input_coord_fields). tests/experiments/clic/test_bench3.py pins that.
+name: bench3_phat16
+
+model:
+  model:
+    init_args:
+      encoder:
+        class_path: hepattn.experiments.clic.a4.PlacementEncoder
+        init_args:
+          gmp_impl: production
+          gmp_layers: null
+          num_layers: 6
+          dim: 256
+          attn_type: patch
+          patch_size: 16
+          gmp: null
+          window_size: null
+          window_wrap: false
+          score_mod: null
+          value_residual: true
+          num_register_tokens: 8
+          patch_global: true
+          attn_kwargs:
+            num_heads: 16
+          norm: FastLayerNorm
+          layer_scale: null
+          drop_path: 0.0
+          qkv_norm: false
+          hybrid_norm: true
+          dense_norm_placement: legacy
+          dense_kwargs:
+            activation: SwiGLU
+      input_sort_field: phi_calo
+      input_sort_period: 6.283185307179586

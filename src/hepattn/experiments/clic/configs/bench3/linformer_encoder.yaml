@@ -1,0 +1,18 @@
+# Overlay on base.yaml: masked-linformer in the encoder only, the encoder-only control for configs/patch.yaml.
+# linformer.yaml also puts linformer in the decoder; this keeps base.yaml's exact decoder, so against patch.yaml the
+# only difference is the encoder attention. The constituent order is patch.yaml's (azimuth at the calorimeter, round
+# the circle from the largest empty gap), since the linformer projections are tied to the key positions too.
+name: clic_linformer_encoder_phicalo
+
+model:
+  model:
+    init_args:
+      input_sort_field: phi_calo
+      input_sort_period: 6.283185307179586 # 2 pi
+      encoder:
+        init_args:
+          attn_type: linformer
+          attn_kwargs:
+            num_heads: 16
+            linformer_seq_len: 168 # data.max_nodes (160) + num_register_tokens (8)
+            linformer_k: 64

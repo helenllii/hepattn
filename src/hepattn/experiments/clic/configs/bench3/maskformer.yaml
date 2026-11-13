@@ -1,0 +1,4 @@
+# bench3 arm 1: the original MaskFormer, i.e. base.yaml's model UNCHANGED (flash-varlen full attention in the
+# encoder, base.yaml's decoder). This overlay only names the run; the model is exactly base.yaml's.
+# Compose: -c configs/bench3/common.yaml -c configs/bench3/maskformer.yaml   (see submit_bench3_polaris.sh)
+name: bench3_maskformer

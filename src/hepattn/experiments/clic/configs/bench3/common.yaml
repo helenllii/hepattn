@@ -1,0 +1,62 @@
+# bench3: the ONE training setup shared by all three arms (MaskFormer / Linformer / PHAT+GMP). Overlay on base.yaml
+# (main.py loads it implicitly), BEFORE the model overlay:
+#
+#   python main.py fit -c configs/bench3/common.yaml -c configs/bench3/<arm>.yaml  [launcher overrides]
+#
+# Everything that sets the cost of a training step is base.yaml's production value: dim 256, bf16-mixed, Lion +
+# OneCycle (lrs_config), gradient clip 0.1, log_every_n_steps 50 (train metrics every 50th batch are part of the real
+# step cost and stay in), the matcher (lap1015_late, parallel), num_val 5000, the full training set (num_train -1).
+#
+# Set by submit_bench3_polaris.sh, identically for every arm: data paths, devices, batch_size and
+# accumulate_grad_batches (from GLOBAL_BATCH / MICRO_BATCH), num_workers, matcher n_jobs, the Compile and
+# DynamoOptimizeDDP callbacks, default_root_dir.
+#
+# Changed from base.yaml, and why (none of these touch the training step):
+#   * checkpointing, the prediction writer, InferenceTimer, SaveConfig and Comet are off: they are I/O, not training.
+#   * num_sanity_val_steps 0: the one validation pass is timed separately by the benchmark callback instead.
+#   * TrainingTimeBenchmark stops the run after its window; max_epochs stays 200 so OneCycleLR's total_steps -- and
+#     therefore the optimizer step being timed -- is the production one.
+trainer:
+  max_epochs: 200
+  accelerator: gpu
+  devices: 4
+  num_nodes: 1
+  strategy: auto
+  precision: bf16-mixed
+  gradient_clip_val: 0.1
+  log_every_n_steps: 50
+  enable_checkpointing: false
+  num_sanity_val_steps: 0
+  # One FULL validation pass (num_val 5000 events) runs right after the measurement window, because the benchmark
+  # sets trainer.should_stop and Lightning validates before stopping. It is timed separately, never mixed into the
+  # training rate.
+  limit_val_batches: 1.0
+
+  logger:
+    class_path: hepattn.experiments.clic.bench3.logger.CSVLogger
+    init_args:
+      save_dir: logs
+
+  # A list overlay REPLACES base.yaml's list. Compile is appended by the launcher (COMPILE=1, default) so it can be
+  # dropped for all arms at once if one arm fails to compile.
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelSummary
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 50
+    - class_path: hepattn.experiments.clic.bench3.TrainingTimeBenchmark
+      init_args:
+        # Batches = micro-batches per rank. Warmup covers torch.compile, recompiles on the first odd shapes and the
+        # dataloader spin-up. 150 measured batches contain exactly 3 of the log_every_n_steps=50 metric batches,
+        # i.e. the production share.
+        warmup_batches: 50
+        measure_batches: 150
+        # Only used if --data.num_train truncates the training set (debug mode): the real post-selection epoch
+        # ("Created training dataset with 994,376 events" in the dim-256 runs).
+        full_train_events: 994376
+
+data:
+  num_train: -1
+  num_val: 5000
+  num_workers: 7
