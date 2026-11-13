@@ -34,7 +34,7 @@
 
 set -uo pipefail
 ulimit -c 0
-JOB_START=$(date +%s)
+JOB_START=${JOB_START:-$(date +%s)}  # a wrapper running several arms in one PBS job passes the real start
 
 # ---------------------------------------------------------------------------------------------------------- knobs
 # exp/gmp-ablation defaults: this worktree's code, and results kept apart from the bench3 Round 1 results in
@@ -45,6 +45,8 @@ ENV_REPO=${ENV_REPO:-/home/siyingli/hepattn-phat}
 ENVROOT=/lus/eagle/projects/hgcal-maskformer-fpga/siyingli/patch-attention-env
 DATA=${DATA:-/eagle/hgcal-maskformer-fpga/clic_data}
 OUT=${OUT:-${ENVROOT}/runs/gmp_ablation}
+ARM_DIR=${ARM_DIR:-configs/bench3}   # where ARM.yaml lives, relative to src/hepattn/experiments/clic
+EXTRA_ARGS=${EXTRA_ARGS:-}
 GPUS=4
 GLOBAL_BATCH=${GLOBAL_BATCH:-1024}
 MICRO_BATCH=${MICRO_BATCH:-256}
@@ -70,8 +72,8 @@ JOB=${PBS_JOBID:-local}; JOB=${JOB%%.*}
 
 if [ "${ROUND0}" = 1 ]; then MODE=round0; elif [ "${ROUND3_EQ}" = 1 ]; then MODE=round3_eq; else MODE=bench; fi
 if [ "${MODE}" = bench ]; then
-  ARM=${ARM:?qsub -v ARM=<name of a configs/bench3/*.yaml>}
-  [ -f "${CLIC}/configs/bench3/${ARM}.yaml" ] && [ "${ARM}" != common ] || { echo "FATAL: no configs/bench3/${ARM}.yaml"; exit 1; }
+  ARM=${ARM:?qsub -v ARM=<name of a ${ARM_DIR}/*.yaml>}
+  [ -f "${CLIC}/${ARM_DIR}/${ARM}.yaml" ] && [ "${ARM}" != common ] || { echo "FATAL: no ${ARM_DIR}/${ARM}.yaml"; exit 1; }
   TAGNAME=${ARM}
 else
   TAGNAME=${MODE}
@@ -182,7 +184,7 @@ fi
 # ======================================================================================= benchmark (one arm)
 RES=${OUT}/results/${ARM}_${JOB}.json
 export BENCH3_RESULT=${RES} BENCH3_PROFILE=${PROFILE}
-ARGS=(-c configs/bench3/common.yaml -c "configs/bench3/${ARM}.yaml" --name "bench3_${ARM}"
+ARGS=(-c configs/bench3/common.yaml -c "${ARM_DIR}/${ARM}.yaml" --name "bench3_${ARM}"
       --data.train_path "${DATA}/train_clic_fix.root" --data.valid_path "${DATA}/val_clic_fix.root"
       --data.test_path "${DATA}/test_clic_common_infer.root"
       --data.num_train "${NUM_TRAIN}" --data.num_workers "${NUM_WORKERS}" --data.batch_size "${MICRO_BATCH}"
@@ -193,6 +195,8 @@ ARGS=(-c configs/bench3/common.yaml -c "configs/bench3/${ARM}.yaml" --name "benc
       "--trainer.callbacks+=hepattn.callbacks.DynamoOptimizeDDP")
 # DynamoOptimizeDDP: the production Polaris setting for every arm (torch 2.9's DDP graph split fails on the patch encoder).
 [ "${COMPILE}" = 1 ] && ARGS+=("--trainer.callbacks+=hepattn.callbacks.Compile")
+# Optional extra CLI arguments, whitespace-separated (e.g. a diagnostics callback); none by default.
+[ -n "${EXTRA_ARGS}" ] && read -r -a _extra <<< "${EXTRA_ARGS}" && ARGS+=("${_extra[@]}")
 
 python main.py fit "${ARGS[@]}" --print_config > "${OUT}/logs/${ARM}_${JOB}_resolved.yaml" 2>>"${LOG}" \
   || { echo "FATAL: config does not resolve; see ${LOG}"; exit 1; }

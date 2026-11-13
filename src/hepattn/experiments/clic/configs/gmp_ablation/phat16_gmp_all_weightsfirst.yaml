@@ -1,0 +1,45 @@
+# gmp_ablation arm: PHAT16 + GMP in ALL 6 layers with the weights-first GMP backend (a4/gmp_weights_first.py).
+#
+# Byte-for-byte configs/bench3/phat16_gmp_all_production.yaml except `name` and `gmp_impl: weightsfirst`, so a bench3
+# run of the two arms is a controlled production-vs-weights-first comparison of the full compiled model. Run with the
+# bench3 launcher: ARM_DIR=configs/gmp_ablation ARM=phat16_gmp_all_weightsfirst (see submit_gmp_fullmodel_bench.sh).
+name: gmp_ablation_phat16_gmp_all_weightsfirst
+
+model:
+  model:
+    init_args:
+      encoder:
+        class_path: hepattn.experiments.clic.a4.PlacementEncoder
+        init_args:
+          gmp_impl: weightsfirst
+          gmp_layers: null
+          num_layers: 6
+          dim: 256
+          attn_type: patch
+          patch_size: 16
+          gmp:
+            kernel_size: 3
+            eta_cell: 0.2
+            phi_cells: 32
+            eta_max: 5.2
+          window_size: null
+          window_wrap: false
+          score_mod: null
+          value_residual: true
+          num_register_tokens: 8
+          patch_global: true
+          attn_kwargs:
+            num_heads: 16
+          norm: FastLayerNorm
+          layer_scale: null
+          drop_path: 0.0
+          qkv_norm: false
+          hybrid_norm: true
+          dense_norm_placement: legacy
+          dense_kwargs:
+            activation: SwiGLU
+      input_sort_field: phi_calo
+      input_sort_period: 6.283185307179586
+      input_coord_fields:
+        - eta_calo
+        - phi_calo
