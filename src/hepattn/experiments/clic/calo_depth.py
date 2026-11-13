@@ -3,6 +3,9 @@
 The calorimeter's inner front envelope is the barrel cylinder r = R_FRONT and the endcap planes |z| = Z_FRONT -- the
 surfaces on which track_x/y/z_int (and so track_eta_int / track_phi_int) are given. Every mode returns 0 on that
 envelope, so a track (whose position is its intersection with the envelope) has depth 0 by construction.
+DESIGN DECISION (2026-11-13): tracks are placed at depth 0 for the initial 3D baseline. This is a choice, not a
+measurement: it cuts some track -> own-shower links (gmp_ablation/GEOMETRY_3D.md, sections 3-4) and is the subject of a
+planned track-depth ablation (tracks at depth 0 vs tracks reaching every depth bin).
 
 Modes (see gmp_ablation/GEOMETRY_3D.md for the data study behind the choice):
   "envelope"    Euclidean distance (mm) from the point to the envelope's interior {r <= R, |z| <= Z}:
