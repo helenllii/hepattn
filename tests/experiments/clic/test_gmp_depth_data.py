@@ -53,10 +53,12 @@ def test_depth_is_opt_in_and_matches_raw_branches(baseline, mode):
     for i in (0, 1, len(ds) // 2, len(ds) - 1):
         (inp, tgt), (inp0, tgt0) = ds[i], baseline[i]
         assert set(inp) - set(inp0) == {"node_depth_calo"} and set(inp0) <= set(inp)
+        # Exact equality, NaN == NaN: the regression targets are NaN-padded beyond the real particles, and torch.equal
+        # is False for any tensor holding a NaN (job 7841964 failed on that, not on a data difference).
         for k in inp0:  # every other input unchanged
-            assert torch.equal(inp[k], inp0[k]), k
+            torch.testing.assert_close(inp[k], inp0[k], rtol=0, atol=0, equal_nan=True, msg=k)
         for k in tgt0:
-            assert torch.equal(tgt[k], tgt0[k]), k
+            torch.testing.assert_close(tgt[k], tgt0[k], rtol=0, atol=0, equal_nan=True, msg=k)
         depth = inp["node_depth_calo"]
         nt, nc = int(ds.n_tracks[i]), int(ds.n_topos[i])
         assert depth.shape == inp0["node_valid"].shape and depth.dtype == torch.float32
