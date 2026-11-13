@@ -52,7 +52,7 @@ class GMPEinsumOpt(GeometricMessagePassing):
 
     def forward(self, x: Tensor, neighbours: Tensor, in_grid: Tensor) -> Tensor:
         batch_size, num_tokens, dim = x.shape
-        num_offsets = self.kernel_size**2
+        num_offsets = self.num_offsets
         # Identical to production up to here, including the off-grid zeroing that stops a padded
         # inf/NaN reaching other tokens through 0 * inf.
         z = torch.bmm(neighbours, torch.where(in_grid.unsqueeze(-1), x, 0.0)).view(batch_size, num_offsets, num_tokens, dim)

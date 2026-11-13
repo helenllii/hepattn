@@ -43,8 +43,9 @@ class MaskFormer(nn.Module):
             input_sort_period: If set, input_sort_field is periodic with this period (2pi for an azimuth) and the
                 constituents are ordered round the circle from the event's largest empty gap, so the order does not
                 split neighbours at the wrap point (see encoder.periodic_sort_value).
-            input_coord_fields: Optional [eta, phi] input fields, merged across the inputs like input_sort_field and passed
-                to the encoder as x_coords, for the geometric message passing of a patch encoder with gmp.
+            input_coord_fields: Optional [eta, phi] (2D GMP) or [eta, phi, depth] (3D GMP) input fields, merged across the
+                inputs like input_sort_field and passed to the encoder as x_coords, for the geometric message passing of a
+                patch encoder with gmp.
             sorter: An optional sorter module used to reorder input constituents before processing.
             unified_decoding: If True, inputs remain merged for task processing instead of being unmerged after encoding.
             dynamic_query_source: Name of the input type to use as the source for dynamic query initialization (default: "hit").
@@ -70,8 +71,8 @@ class MaskFormer(nn.Module):
         assert not (input_sort_field and sorter), "Cannot specify both input_sort_field and sorter."
         if input_sort_period is not None and (not input_sort_field or input_sort_period <= 0):
             raise ValueError(f"input_sort_period needs input_sort_field and a positive period, got {input_sort_field!r}, {input_sort_period}")
-        if input_coord_fields is not None and len(input_coord_fields) != 2:
-            raise ValueError(f"input_coord_fields must be the [eta, phi] fields, got {input_coord_fields}")
+        if input_coord_fields is not None and len(input_coord_fields) not in {2, 3}:
+            raise ValueError(f"input_coord_fields must be the [eta, phi] or [eta, phi, depth] fields, got {input_coord_fields}")
         # A sorter reorders the merged inputs before the encoder, which the coordinates would not follow
         assert not (input_coord_fields and sorter), "Cannot specify both input_coord_fields and sorter."
         self.input_sort_field = input_sort_field
@@ -150,7 +151,7 @@ class MaskFormer(nn.Module):
             x_sort_value = periodic_sort_value(x_sort_value, x.get("key_valid"), self.input_sort_period)
         if x_sort_value is not None:
             x["key_sort_idx"] = sort_index(x_sort_value, x.get("key_valid"))
-        # The (B, S, 2) GMP coordinates in the merged slot order; the encoder sorts them with the tokens
+        # The (B, S, 2) or (B, S, 3) GMP coordinates in the merged slot order; the encoder sorts them with the tokens
         encoder_kwargs = {}
         if self.input_coord_fields:
             encoder_kwargs["x_coords"] = torch.stack(

@@ -97,8 +97,73 @@ def gmp_neighbourhood(
     return torch.cat(offsets, dim=-2), in_grid
 
 
+def gmp_neighbourhood_3d(
+    eta: Tensor,
+    phi: Tensor,
+    depth: Tensor,
+    valid: Tensor,
+    kernel_size: int,
+    eta_cell: float,
+    phi_cells: int,
+    eta_max: float,
+    depth_cell: float,
+    depth_kernel_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """gmp_neighbourhood with a third, non-periodic depth axis: the cell offsets on an (eta, phi, depth) grid.
+
+    Cells: u and v as in gmp_neighbourhood; w = floor(max(depth, 0) / depth_cell), unbounded above (the pairwise form
+    needs only cell differences, so there is no depth range and no overflow bin; a small negative depth, e.g. a cluster
+    barycentre a few mm in front of the calorimeter face, joins the first bin). Off the grid, as in 2D: padding, and
+    real tokens with a non-finite coordinate or |eta| > eta_max.
+
+    Args:
+        eta: (B, N) pseudorapidity; padded entries may hold anything, including NaN.
+        phi: (B, N) azimuth in radians, any branch.
+        depth: (B, N) depth coordinate (e.g. mm into the calorimeter); padded entries may hold anything, including NaN.
+        valid: (B, N), True for real tokens.
+        kernel_size: Odd side k of the kernel in eta and phi, in cells.
+        eta_cell: Cell size in eta.
+        phi_cells: Number of cells round the circle in phi.
+        eta_max: Grid range in eta, [-eta_max, eta_max].
+        depth_cell: Cell size in depth.
+        depth_kernel_size: Odd kernel extent in depth, in cells; defaults to kernel_size.
+
+    Returns:
+        neighbours: (B, K * N, N) bool, K = kernel_size**2 * depth_kernel_size; row o * N + i, column j is True when j is
+            i's neighbour at offset o = ((du + r) * k + (dv + r)) * kd + (dw + rd), du = u_j - u_i, dv = v_j - v_i
+            (wrapped), dw = w_j - w_i: (du, dv, dw) in row-major order, the order of a depthwise
+            Conv3d(kernel (k, k, kd)) weight flattened to (D, K). Offsets o and K - 1 - o are opposite, so
+            neighbours[o, i, j] == neighbours[K - 1 - o, j, i], as in 2D.
+        in_grid: (B, N) bool, the tokens on the grid.
+    """
+    kd = kernel_size if depth_kernel_size is None else depth_kernel_size
+    r, rd = kernel_size // 2, kd // 2
+    in_grid = valid & eta.isfinite() & phi.isfinite() & depth.isfinite() & (eta.abs() <= eta_max)
+    eta = torch.where(in_grid, eta, 0.0)
+    phi = torch.where(in_grid, phi, 0.0)
+    depth = torch.where(in_grid, depth, 0.0)
+    u = torch.floor((eta + eta_max) / eta_cell).long()
+    v = torch.remainder(torch.floor(phi * (phi_cells / (2 * math.pi))), phi_cells).long()
+    w = torch.floor(depth.clamp_min(0.0) / depth_cell).long()
+    du = u.unsqueeze(-2) - u.unsqueeze(-1)  # (B, N_i, N_j)
+    dv = torch.remainder(v.unsqueeze(-2) - v.unsqueeze(-1) + r, phi_cells) - r
+    dw = w.unsqueeze(-2) - w.unsqueeze(-1)
+    pairs = in_grid.unsqueeze(-1) & in_grid.unsqueeze(-2)
+    offsets = [pairs & (du == a) & (dv == b) & (dw == c) for a in range(-r, r + 1) for b in range(-r, r + 1) for c in range(-rd, rd + 1)]
+    return torch.cat(offsets, dim=-2), in_grid
+
+
 class GeometricMessagePassing(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 3, eta_cell: float = 0.2, phi_cells: int = 32, eta_max: float = 5.2) -> None:
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 3,
+        eta_cell: float = 0.2,
+        phi_cells: int = 32,
+        eta_max: float = 5.2,
+        depth_cell: float | None = None,
+        depth_kernel_size: int | None = None,
+    ) -> None:
         """Geometric message passing (GMP) after PHAT-JeT [2605.21789]: sum the tokens in each (eta, phi) cell, a depthwise
         k x k convolution over the grid, read back at each token's cell, then x + LayerNorm(Linear(.)), as the reference
         GeometricMessagePassing. Adapted to a full-azimuth detector: a fixed grid with phi periodic, padding masked.
@@ -113,6 +178,10 @@ class GeometricMessagePassing(nn.Module):
             eta_cell: Cell size in eta.
             phi_cells: Number of cells round the circle in phi (cell size 2pi / phi_cells), at least kernel_size.
             eta_max: Grid range in eta, [-eta_max, eta_max]; tokens outside it skip GMP unchanged.
+            depth_cell: If set, 3D GMP: a third, non-periodic depth axis with this cell size (gmp_neighbourhood_3d), and
+                a depthwise Conv3d (k, k, depth_kernel_size) in place of the Conv2d. None (the default) is the 2D GMP,
+                unchanged: same modules, parameters, initialization and arithmetic.
+            depth_kernel_size: 3D only: odd kernel extent in depth, in cells; defaults to kernel_size.
         """
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 == 0:
@@ -121,32 +190,51 @@ class GeometricMessagePassing(nn.Module):
             raise ValueError(f"GMP phi_cells ({phi_cells}) must be at least kernel_size ({kernel_size}), or the kernel would wrap onto itself")
         if eta_cell <= 0 or eta_max <= 0:
             raise ValueError(f"GMP eta_cell and eta_max must be positive, got {eta_cell}, {eta_max}")
+        if depth_cell is None and depth_kernel_size is not None:
+            raise ValueError("GMP depth_kernel_size is a 3D setting: it needs depth_cell")
+        if depth_cell is not None:
+            if depth_cell <= 0:
+                raise ValueError(f"GMP depth_cell must be positive, got {depth_cell}")
+            depth_kernel_size = kernel_size if depth_kernel_size is None else depth_kernel_size
+            if depth_kernel_size < 1 or depth_kernel_size % 2 == 0:
+                raise ValueError(f"GMP depth_kernel_size must be odd and positive, got {depth_kernel_size}")
         self.kernel_size = kernel_size
         self.eta_cell = eta_cell
         self.phi_cells = phi_cells
         self.eta_max = eta_max
-        # Only the parameters of this depthwise conv are used (its weight[c, 0, du, dv]), and nn.Conv2d's initialization
-        self.dw = nn.Conv2d(dim, dim, kernel_size, groups=dim, bias=True)
+        self.depth_cell = depth_cell
+        self.depth_kernel_size = depth_kernel_size
+        # Number of kernel offsets K: the rows of the neighbours tensor are K blocks of N
+        self.num_offsets = kernel_size**2 * (depth_kernel_size or 1)
+        # Only the parameters of this depthwise conv are used (its weight[c, 0, du, dv] or [c, 0, du, dv, dw], flattened
+        # to (D, K) in the neighbourhood's offset order), and nn.Conv2d's / nn.Conv3d's initialization
+        if depth_cell is None:
+            self.dw = nn.Conv2d(dim, dim, kernel_size, groups=dim, bias=True)
+        else:
+            self.dw = nn.Conv3d(dim, dim, (kernel_size, kernel_size, depth_kernel_size), groups=dim, bias=True)
         self.pointwise = nn.Linear(dim, dim)
         self.norm = nn.LayerNorm(dim, eps=1e-6)
 
     @property
     def geometry(self) -> dict:
-        return {"kernel_size": self.kernel_size, "eta_cell": self.eta_cell, "phi_cells": self.phi_cells, "eta_max": self.eta_max}
+        geometry = {"kernel_size": self.kernel_size, "eta_cell": self.eta_cell, "phi_cells": self.phi_cells, "eta_max": self.eta_max}
+        if self.depth_cell is not None:
+            geometry |= {"depth_cell": self.depth_cell, "depth_kernel_size": self.depth_kernel_size}
+        return geometry
 
     def forward(self, x: Tensor, neighbours: Tensor, in_grid: Tensor) -> Tensor:
         """Update the tokens on the grid.
 
         Args:
             x: (B, N, D) tokens.
-            neighbours: (B, k * k * N, N) from gmp_neighbourhood, as a float tensor.
+            neighbours: (B, K * N, N) from gmp_neighbourhood (K = k * k) or gmp_neighbourhood_3d, as a float tensor.
             in_grid: (B, N) from gmp_neighbourhood.
 
         Returns:
             (B, N, D): x + LayerNorm(Linear(conv)) for the tokens on the grid, x unchanged for the rest.
         """
         batch_size, num_tokens, dim = x.shape
-        num_offsets = self.kernel_size**2
+        num_offsets = self.num_offsets
         # Zero the tokens off the grid, so a padded inf/NaN cannot reach the others through 0 * inf
         z = torch.bmm(neighbours, torch.where(in_grid.unsqueeze(-1), x, 0.0)).view(batch_size, num_offsets, num_tokens, dim)
         z = torch.einsum("bond,do->bnd", z, self.dw.weight.view(dim, num_offsets)) + self.dw.bias
@@ -404,7 +492,9 @@ class Encoder(nn.Module):
             patch_global: attn_type "patch" only: whether to run the global patch-token stage.
             gmp: attn_type "patch" only: if set, every layer starts with geometric message passing on an (eta, phi) grid,
                 configured by these GeometricMessagePassing keyword arguments (kernel_size, eta_cell, phi_cells, eta_max),
-                and forward needs x_coords. None (the default) leaves the patch encoder without GMP.
+                and forward needs x_coords. With depth_cell (and optionally depth_kernel_size) set, the grid is
+                (eta, phi, depth) and x_coords carries a third, depth column. None (the default) leaves the patch
+                encoder without GMP.
             **layer_kwargs: Keyword arguments for EncoderLayer.
         """
         super().__init__()
@@ -437,6 +527,10 @@ class Encoder(nn.Module):
         self.patch_size = patch_size if attn_type == PATCH_ATTN_TYPE else None
         self.patch_global = patch_global
         self.gmp = gmp
+        # 3D GMP when depth_cell is set; the neighbourhood is built from the non-None geometry keys only, so a config
+        # that spells out depth_cell: null is the 2D GMP and calls gmp_neighbourhood exactly as before
+        self.gmp_coord_dims = 3 if gmp is not None and gmp.get("depth_cell") is not None else 2
+        self._gmp_kwargs = {k: v for k, v in gmp.items() if v is not None} if gmp is not None else None
 
         # Initialize register tokens if specified
         if self.num_register_tokens is not None:
@@ -482,13 +576,16 @@ class Encoder(nn.Module):
             x: (B, S, D) tokens.
             x_sort_value: Optional (B, S) value to sort the tokens by before the layers.
             kv_mask: Optional (B, S) mask, True for real tokens.
-            x_coords: (B, S, 2) (eta, phi) of the tokens for GMP; required exactly when gmp is set.
+            x_coords: (B, S, 2) (eta, phi), or (B, S, 3) (eta, phi, depth) for 3D GMP, of the tokens; required exactly
+                when gmp is set.
             **kwargs: Passed to the layers (not with attn_type "patch").
         """
         batch_size = x.shape[0]
         seq_len = x.shape[-2]
         if (x_coords is not None) != (self.gmp is not None):
             raise ValueError("x_coords (eta, phi) are needed by, and only used by, an encoder with gmp")
+        if x_coords is not None and x_coords.shape[-1] != self.gmp_coord_dims:
+            raise ValueError(f"this GMP needs {self.gmp_coord_dims} coordinates per token, got x_coords {tuple(x_coords.shape)}")
 
         # If value to sort on is provided, use it to sort the tokens
         # We don't need to use the stable sort assuming that the sort values are unique
@@ -575,8 +672,9 @@ class Encoder(nn.Module):
         return x
 
     def _patch_forward(self, x: Tensor, kv_mask: Tensor | None, x_coords: Tensor | None = None) -> Tensor:
-        """Patch attention over (B, S, D) constituents, with their (B, S, 2) (eta, phi) for GMP, returning (B, S, D) in
-        the same slot order."""
+        """Patch attention over (B, S, D) constituents, with their (B, S, 2) (eta, phi) or (B, S, 3) (eta, phi, depth)
+        coordinates for GMP, returning (B, S, D) in the same slot order.
+        """
         assert self.patch_size is not None
         batch_size, seq_len, dim = x.shape
         valid = kv_mask if kv_mask is not None else torch.ones(batch_size, seq_len, dtype=torch.bool, device=x.device)
@@ -602,8 +700,11 @@ class Encoder(nn.Module):
             assert x_coords is not None
             x_coords = torch.gather(x_coords, -2, order.unsqueeze(-1).expand_as(x_coords))
             if pad:
-                x_coords = torch.cat([x_coords, x_coords.new_zeros(batch_size, pad, 2)], dim=1)
-            neighbours, in_grid = gmp_neighbourhood(x_coords[..., 0], x_coords[..., 1], valid, **self.gmp)
+                x_coords = torch.cat([x_coords, x_coords.new_zeros(batch_size, pad, x_coords.shape[-1])], dim=1)
+            if self.gmp_coord_dims == 3:
+                neighbours, in_grid = gmp_neighbourhood_3d(x_coords[..., 0], x_coords[..., 1], x_coords[..., 2], valid, **self._gmp_kwargs)
+            else:
+                neighbours, in_grid = gmp_neighbourhood(x_coords[..., 0], x_coords[..., 1], valid, **self._gmp_kwargs)
             gmp_geometry = (neighbours.to(x.dtype), in_grid)
 
         x = x.view(batch_size, num_patches, self.patch_size, dim)

@@ -180,7 +180,7 @@ class GMPWeightsFirst(GeometricMessagePassing):
         dim = x.shape[-1]
         # Identical masking to production: off-grid tokens are zeroed, so a padded inf/NaN cannot reach the others
         xm = torch.where(in_grid.unsqueeze(-1), x, 0.0)
-        z = weights_first_conv(xm, neighbours, self.dw.weight.view(dim, self.kernel_size**2), self.strategy) + self.dw.bias
+        z = weights_first_conv(xm, neighbours, self.dw.weight.view(dim, self.num_offsets), self.strategy) + self.dw.bias
         return torch.where(in_grid.unsqueeze(-1), x + self.norm(self.pointwise(z)), x)
 
 

@@ -100,7 +100,7 @@ class GMPLayer(nn.Module):
 
     @classmethod
     def from_module(cls, gmp: GeometricMessagePassing, conv) -> GMPLayer:
-        dim, num_offsets = gmp.dw.weight.shape[0], gmp.kernel_size**2
+        dim, num_offsets = gmp.dw.weight.shape[0], gmp.num_offsets
         layer = cls(dim, num_offsets, conv).to(device=gmp.dw.weight.device, dtype=gmp.dw.weight.dtype)
         with torch.no_grad():
             layer.dw_weight.copy_(gmp.dw.weight.view(dim, num_offsets))
