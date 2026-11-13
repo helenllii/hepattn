@@ -52,7 +52,7 @@ CLIC=${BENCH_REPO}/src/hepattn/experiments/clic
   cd "${BENCH_REPO}" || exit 1
   (CUDA_VISIBLE_DEVICES=0 timeout -k 30 1500 taskset -c 0-15 python -X faulthandler -m pytest -v -s -p no:cacheprovider -rfEs \
      -o faulthandler_timeout=600 --durations=20 --junitxml="${VOUT}/pytest.xml" \
-     tests/models/test_gmp3d.py tests/models/test_gmp_weights_first.py tests/models/test_a4_placement.py tests/models/test_gmp.py \
+     tests/models/test_gmp3d.py tests/models/test_gmp3d_extra.py tests/models/test_gmp_weights_first.py tests/models/test_a4_placement.py tests/models/test_gmp.py \
      tests/models/test_patch_attention.py tests/experiments/clic/test_bench3.py tests/experiments/clic/test_pflow_dataloader_options.py \
      tests/experiments/clic/test_gmp_depth_data.py tests/experiments/clic/test_gmp_sweep_configs.py > "${VOUT}/pytest.log" 2>&1
    echo "==> pytest exit $? $(date -Is)" | tee -a "${VOUT}/job.log") &
