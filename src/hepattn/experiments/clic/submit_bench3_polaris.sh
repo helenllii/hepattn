@@ -37,11 +37,14 @@ ulimit -c 0
 JOB_START=$(date +%s)
 
 # ---------------------------------------------------------------------------------------------------------- knobs
-BENCH_REPO=${BENCH_REPO:-/home/siyingli/hepattn-polaris-bench}
+# exp/gmp-ablation defaults: this worktree's code, and results kept apart from the bench3 Round 1 results in
+# runs/bench3 (which were produced from polaris/bench-d256 @ ea2ab7b + the bench3 snapshot f1a55e6). Both remain
+# overridable: qsub -v BENCH_REPO=...,OUT=... submit_bench3_polaris.sh
+BENCH_REPO=${BENCH_REPO:-/home/siyingli/hepattn-gmp-ablation}
 ENV_REPO=${ENV_REPO:-/home/siyingli/hepattn-phat}
 ENVROOT=/lus/eagle/projects/hgcal-maskformer-fpga/siyingli/patch-attention-env
 DATA=${DATA:-/eagle/hgcal-maskformer-fpga/clic_data}
-OUT=${OUT:-${ENVROOT}/runs/bench3}
+OUT=${OUT:-${ENVROOT}/runs/gmp_ablation}
 GPUS=4
 GLOBAL_BATCH=${GLOBAL_BATCH:-1024}
 MICRO_BATCH=${MICRO_BATCH:-256}
