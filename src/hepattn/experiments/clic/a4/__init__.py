@@ -7,9 +7,12 @@ Nothing here modifies production code. `PlacementEncoder` is a subclass of
 
 from hepattn.experiments.clic.a4.encoder import PlacementEncoder
 from hepattn.experiments.clic.a4.gmp_impl import GMP_IMPLS, GMPEinsumOpt
+from hepattn.experiments.clic.a4.gmp_weights_first import GMPWeightsFirst, GMPWeightsFirstLoop
 
 __all__ = [
     "GMP_IMPLS",
     "GMPEinsumOpt",
+    "GMPWeightsFirst",
+    "GMPWeightsFirstLoop",
     "PlacementEncoder",
 ]

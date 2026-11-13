@@ -60,9 +60,14 @@ class GMPEinsumOpt(GeometricMessagePassing):
         return torch.where(in_grid.unsqueeze(-1), x + self.norm(self.pointwise(z)), x)
 
 
-# Both entries take production's (x, neighbours, in_grid) geometry, so `PlacementEncoder` never
+# Imported here, below GMPEinsumOpt, so the registry lists every implementation in one place.
+from hepattn.experiments.clic.a4.gmp_weights_first import GMPWeightsFirst, GMPWeightsFirstLoop  # noqa: E402
+
+# Every entry takes production's (x, neighbours, in_grid) geometry, so `PlacementEncoder` never
 # has to touch `Encoder._patch_forward`.
 GMP_IMPLS: dict[str, type[GeometricMessagePassing]] = {
     "production": GeometricMessagePassing,
     "einsumopt": GMPEinsumOpt,
+    "weightsfirst": GMPWeightsFirst,  # Option B, one fused matmul (gmp_weights_first.py)
+    "weightsfirst_loop": GMPWeightsFirstLoop,  # Option B, one matmul per kernel offset
 }
