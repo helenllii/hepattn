@@ -13,7 +13,8 @@ it records, per rank, into $GMP_DIAG_OUT (or <default_root_dir>/gmp_diagnostics.
 * numerical health of every training step: non-finite loss count, non-finite pre-clip gradient count, and the largest
   finite pre-clip global gradient norm. Accumulated on the GPU without a host sync per step (one foreach-norm per
   step, read back once at the end), and paid identically by every arm;
-* per training epoch (sweeps): wall time, optimizer steps, steps/s and peak GPU memory (allocated and reserved).
+* per training epoch (sweeps): training wall time with the validation loop subtracted (Lightning runs it inside the
+  training epoch), validation time, optimizer steps, steps/s and peak GPU memory (allocated and reserved).
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ class GMPDiagnostics(Callback):
         self._health: torch.Tensor | None = None  # [steps, nonfinite_loss, nonfinite_grad, max_finite_gnorm]
         self._epoch_t0: float | None = None
         self._epoch_step0 = 0
+        self._val_s = 0.0
+        self._val_t0: float | None = None
         self._res["epochs"] = []
 
     # ------------------------------------------------------------------------------------------- parameters
@@ -161,16 +164,43 @@ class GMPDiagnostics(Callback):
             torch.cuda.reset_peak_memory_stats()
         self._epoch_t0 = time.perf_counter()
         self._epoch_step0 = trainer.global_step
+        self._val_s = 0.0
+
+    # Lightning runs the validation loop INSIDE the training epoch (before on_train_epoch_end), so it is timed here and
+    # subtracted: train_wall_s / steps_per_s are training-only, val_s is the validation loop.
+    def on_validation_epoch_start(self, trainer, pl_module) -> None:
+        if trainer.sanity_checking or self._epoch_t0 is None:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._val_t0 = time.perf_counter()
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if trainer.sanity_checking or self._val_t0 is None:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._val_s += time.perf_counter() - self._val_t0
+        self._val_t0 = None
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
         if self._epoch_t0 is None:
             return
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        wall = time.perf_counter() - self._epoch_t0
+        epoch_wall = time.perf_counter() - self._epoch_t0
+        val_s = self._val_s
+        wall = epoch_wall - val_s
         steps = trainer.global_step - self._epoch_step0
         gib = 2.0**30
-        rec = {"epoch": trainer.current_epoch, "train_wall_s": wall, "optimizer_steps": steps, "steps_per_s": steps / wall if wall > 0 else None}
+        rec = {
+            "epoch": trainer.current_epoch,
+            "train_wall_s": wall,
+            "val_s": val_s,
+            "epoch_wall_s": epoch_wall,
+            "optimizer_steps": steps,
+            "steps_per_s": steps / wall if wall > 0 else None,
+        }
         if torch.cuda.is_available():
             rec |= {"peak_alloc_gib": torch.cuda.max_memory_allocated() / gib, "peak_reserved_gib": torch.cuda.max_memory_reserved() / gib}
         self._res["epochs"].append(rec)
