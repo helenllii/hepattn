@@ -22,7 +22,7 @@
 
 set -uo pipefail
 ulimit -c 0
-export JOB_START=$(date +%s)
+export JOB_START=${JOB_START:-$(date +%s)}  # inherited when called from a validation job
 BENCH_REPO=${BENCH_REPO:-/home/siyingli/hepattn-gmp-ablation}
 ENVROOT=/lus/eagle/projects/hgcal-maskformer-fpga/siyingli/patch-attention-env
 export OUT=${OUT:-${ENVROOT}/runs/gmp_ablation/fullmodel}

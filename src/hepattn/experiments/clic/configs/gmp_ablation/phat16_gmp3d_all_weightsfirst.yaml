@@ -1,0 +1,54 @@
+# gmp_ablation arm: PHAT16 + 3D GMP (eta, phi, calorimeter depth) in ALL 6 layers, GMP backend weightsfirst.
+#
+# Engineering smoke/benchmark arm for the 3D implementation (task 3): configs/gmp_ablation/phat16_gmp_all_weightsfirst.yaml
+# with three changes -- the depth axis in `gmp` (depth_cell, depth_kernel_size), a third input coordinate field
+# (depth_calo) and data.gmp_depth. The depth definition and cell size here are PROVISIONAL (envelope, 200 mm): they do
+# not change the cost of the dense pairwise GMP (that depends only on K = 27 and N), and the physics choice is made in
+# gmp_ablation/GEOMETRY_3D.md and the grid sweep.
+name: gmp_ablation_phat16_gmp3d_all_weightsfirst
+
+model:
+  model:
+    init_args:
+      encoder:
+        class_path: hepattn.experiments.clic.a4.PlacementEncoder
+        init_args:
+          gmp_impl: weightsfirst
+          gmp_layers: null
+          num_layers: 6
+          dim: 256
+          attn_type: patch
+          patch_size: 16
+          gmp:
+            kernel_size: 3
+            eta_cell: 0.2
+            phi_cells: 32
+            eta_max: 5.2
+            depth_cell: 200.0       # mm of calorimeter depth per cell (calo_depth "envelope"); PROVISIONAL, see header
+            depth_kernel_size: 3    # 3 x 3 x 3 = 27 offsets
+          window_size: null
+          window_wrap: false
+          score_mod: null
+          value_residual: true
+          num_register_tokens: 8
+          patch_global: true
+          attn_kwargs:
+            num_heads: 16
+          norm: FastLayerNorm
+          layer_scale: null
+          drop_path: 0.0
+          qkv_norm: false
+          hybrid_norm: true
+          dense_norm_placement: legacy
+          dense_kwargs:
+            activation: SwiGLU
+      input_sort_field: phi_calo
+      input_sort_period: 6.283185307179586
+      input_coord_fields:
+        - eta_calo
+        - phi_calo
+        - depth_calo
+
+data:
+  # node_depth_calo: the third GMP coordinate (calo_depth.py), 0 for tracks
+  gmp_depth: envelope

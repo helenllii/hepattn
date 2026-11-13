@@ -12,13 +12,15 @@ it records, per rank, into $GMP_DIAG_OUT (or <default_root_dir>/gmp_diagnostics.
   compiled graph; the extra forward falls inside the benchmark's warmup;
 * numerical health of every training step: non-finite loss count, non-finite pre-clip gradient count, and the largest
   finite pre-clip global gradient norm. Accumulated on the GPU without a host sync per step (one foreach-norm per
-  step, read back once at the end), and paid identically by every arm.
+  step, read back once at the end), and paid identically by every arm;
+* per training epoch (sweeps): wall time, optimizer steps, steps/s and peak GPU memory (allocated and reserved).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -36,6 +38,9 @@ class GMPDiagnostics(Callback):
         self._probed = False
         self._res: dict = {}
         self._health: torch.Tensor | None = None  # [steps, nonfinite_loss, nonfinite_grad, max_finite_gnorm]
+        self._epoch_t0: float | None = None
+        self._epoch_step0 = 0
+        self._res["epochs"] = []
 
     # ------------------------------------------------------------------------------------------- parameters
     def on_train_start(self, trainer, pl_module) -> None:
@@ -149,6 +154,30 @@ class GMPDiagnostics(Callback):
         if isinstance(loss, torch.Tensor):
             self._health[1] += (~torch.isfinite(loss.detach().float())).float()
 
+    # ------------------------------------------------------------------------------------------ per-epoch cost
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        self._epoch_t0 = time.perf_counter()
+        self._epoch_step0 = trainer.global_step
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self._epoch_t0 is None:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        wall = time.perf_counter() - self._epoch_t0
+        steps = trainer.global_step - self._epoch_step0
+        gib = 2.0**30
+        rec = {"epoch": trainer.current_epoch, "train_wall_s": wall, "optimizer_steps": steps, "steps_per_s": steps / wall if wall > 0 else None}
+        if torch.cuda.is_available():
+            rec |= {"peak_alloc_gib": torch.cuda.max_memory_allocated() / gib, "peak_reserved_gib": torch.cuda.max_memory_reserved() / gib}
+        self._res["epochs"].append(rec)
+        self._write(trainer)
+        if trainer.is_global_zero:
+            print(f"[gmp-diag] epoch {json.dumps(rec)}", flush=True)
+
     def on_train_end(self, trainer, pl_module) -> None:
         if self._health is not None:
             steps, bad_loss, bad_grad, gmax = self._health.tolist()
@@ -158,14 +187,19 @@ class GMPDiagnostics(Callback):
                 "nonfinite_grad_steps": int(bad_grad),
                 "max_finite_preclip_grad_norm": gmax,
             }
+        path = self._write(trainer)
+        if trainer.is_global_zero:
+            print(f"[gmp-diag] health {json.dumps(self._res.get('health'))} -> {path}", flush=True)
+
+    def _write(self, trainer) -> Path:
+        """Write the record so far (also after every epoch, so a run cut short keeps its finished epochs)."""
         self._res["rank"] = trainer.global_rank
         self._res["pbs_jobid"] = os.environ.get("PBS_JOBID")
         base = self.out_path or os.environ.get("GMP_DIAG_OUT") or str(Path(trainer.default_root_dir) / "gmp_diagnostics.json")
         path = Path(f"{base}.rank{trainer.global_rank}.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self._res, indent=1, default=str))
-        if trainer.is_global_zero:
-            print(f"[gmp-diag] health {json.dumps(self._res.get('health'))} -> {path}", flush=True)
+        return path
 
 
 def _tensors(obj):
