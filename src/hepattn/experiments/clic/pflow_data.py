@@ -9,6 +9,8 @@ from lightning import seed_everything
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from hepattn.experiments.clic.calo_depth import MODES as DEPTH_MODES
+from hepattn.experiments.clic.calo_depth import topo_depth
 from hepattn.utils.scaling import FeatureScaler
 
 
@@ -41,8 +43,21 @@ class CLICDataset(Dataset):
         incidence_cutval: float = 1e-4,
         is_inference: bool = False,
         dummy_data: bool = False,
+        gmp_depth: str | None = None,
     ):
+        """CLIC particle-flow dataset.
+
+        gmp_depth: If set, also provide node_depth_calo, the third (depth) coordinate of 3D GMP, computed by
+            calo_depth.topo_depth with this mode ("envelope", "projective" or "compartment"); tracks get 0 (their
+            position is their intersection with the calorimeter front face). None (the default) changes nothing.
+
+        Raises:
+            ValueError: If gmp_depth is not None or one of calo_depth.MODES.
+        """
         super().__init__()
+        if gmp_depth is not None and gmp_depth not in DEPTH_MODES:
+            raise ValueError(f"gmp_depth must be one of {DEPTH_MODES} or None, got {gmp_depth!r}")
+        self.gmp_depth = gmp_depth
 
         self.sampling_seed = 42
         np.random.default_rng(self.sampling_seed)
@@ -55,6 +70,9 @@ class CLICDataset(Dataset):
 
         # init variable lists
         self.init_variables_list()
+        if self.gmp_depth in {"envelope", "projective"}:
+            # positions are read only to compute the depth, then dropped (load_data)
+            self.topo_variables += ["topo_x", "topo_y", "topo_z"]
 
         # input stuff
         self.filepath = filepath
@@ -143,6 +161,13 @@ class CLICDataset(Dataset):
         # transform variables and transform to tensors
         for key, val in self.full_data_array.items():
             self.full_data_array[key] = torch.tensor(val)
+
+        if self.gmp_depth is not None:
+            # 3D GMP depth of every topo cluster, once, vectorised; the positions are not kept
+            pos = [self.full_data_array.pop(k).numpy() if k in self.full_data_array else None for k in ("topo_x", "topo_y", "topo_z")]
+            self.topo_variables = [v for v in self.topo_variables if v not in {"topo_x", "topo_y", "topo_z"}]
+            energies = [self.full_data_array[k].numpy() for k in ("topo_energy_ecal", "topo_energy_hcal", "topo_energy_other")]
+            self.full_data_array["topo_depth_calo"] = torch.from_numpy(topo_depth(self.gmp_depth, *pos, *energies))
 
         self.topo_cumsum = np.cumsum([0, *self.n_topos.tolist()])
         self.track_cumsum = np.cumsum([0, *self.n_tracks.tolist()])
@@ -390,6 +415,11 @@ class CLICDataset(Dataset):
             val = do_padding(val, self.max_nodes)
             node_features[key] = val
 
+        if self.gmp_depth is not None:
+            # 3D GMP depth (calo_depth): 0 for tracks, which sit on the calorimeter front face
+            topo_depth_calo = self.full_data_array["topo_depth_calo"][topo_start:topo_end]
+            node_raw_features["depth_calo"] = torch.cat([torch.zeros(n_tracks, dtype=torch.float32), topo_depth_calo.float()], -1)
+
         for key, val in node_raw_features.items():
             val = do_padding(val, self.max_nodes)
             node_raw_features[key] = val
@@ -501,6 +531,8 @@ class CLICDataset(Dataset):
             "node_cosphi": torch.randn(self.max_nodes),
             "node_is_track": torch.zeros(self.max_nodes, dtype=torch.float32),
         }
+        if self.gmp_depth is not None:
+            inputs["node_depth_calo"] = torch.rand(self.max_nodes) * 1500.0
 
         # Set valid nodes
         inputs["node_valid"][:n_nodes] = True
@@ -554,6 +586,8 @@ class CLICDataset(Dataset):
             "node_cosphi": data_dict["node_raw_features"]["cosphi"],
             "node_is_track": data_dict["node_raw_features"]["is_track"],
         }
+        if self.gmp_depth is not None:
+            inputs["node_depth_calo"] = data_dict["node_raw_features"]["depth_calo"]
 
         # set class labels (5 is residual & fake, 0-4 are the real classes)
         class_labels = data_dict["particle_data"]["class"].long()
