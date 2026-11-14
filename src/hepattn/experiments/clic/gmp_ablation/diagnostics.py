@@ -211,7 +211,8 @@ class GMPDiagnostics(Callback):
 
     def _snapshot_health(self) -> None:
         """Copy the GPU health counters into the record (one host sync). Called at every epoch end and at train end,
-        so a run that dies after an epoch (e.g. in a later callback) keeps its health record (job 7843955 lost it)."""
+        so a run that dies after an epoch (e.g. in a later callback) keeps its health record (job 7843955 lost it).
+        """
         if self._health is not None:
             steps, bad_loss, bad_grad, gmax = self._health.tolist()
             self._res["health"] = {
