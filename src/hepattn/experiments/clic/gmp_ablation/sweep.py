@@ -35,6 +35,8 @@ ARMS: dict[str, tuple[dict | None, str | None, list[int] | None]] = {
     "g3d_env_dz400": (GRID_2D | {"depth_cell": 400.0, "depth_kernel_size": 3}, "envelope", None),
     "g3d_proj_dz200": (GRID_2D | {"depth_cell": 200.0, "depth_kernel_size": 3}, "projective", None),
     "g3d_comp": (GRID_2D | {"depth_cell": 1.0, "depth_kernel_size": 3}, "compartment", None),
+    # track-depth ablation: as g3d_env_dz200, but track-cluster pairs ignore the depth difference (tracks at "any" depth)
+    "g3d_env_dz200_trkany": (GRID_2D | {"depth_cell": 200.0, "depth_kernel_size": 3, "depth_wildcard": True}, "envelope", None),
     # placement factor (fixed 2D production grid): GMP only in block 0
     "g2d_e020_early": (GRID_2D, None, [0]),
 }
@@ -61,6 +63,11 @@ ENCODER = {  # PHAT16, identical to configs/bench3/phat16_gmp_all_production.yam
 }
 
 
+# Arms whose tracks take CLICDataset(gmp_track_depth=...) other than the default "front" (depth 0, the 3D baseline).
+# A track depth of "any" needs a GMP with depth_wildcard: test_gmp_sweep_configs pins that pairing.
+TRACK_DEPTH = {"g3d_env_dz200_trkany": "any"}
+
+
 def arm_config(name: str) -> dict:
     gmp, depth, layers = ARMS[name]
     enc = {"gmp_impl": "weightsfirst" if gmp is not None else "production", "gmp_layers": layers, **ENCODER, "gmp": gmp}
@@ -74,6 +81,8 @@ def arm_config(name: str) -> dict:
     cfg = {"name": f"gmp_sweep_{name}", "model": {"model": {"init_args": init}}}
     if depth:
         cfg["data"] = {"gmp_depth": depth}
+        if name in TRACK_DEPTH:
+            cfg["data"]["gmp_track_depth"] = TRACK_DEPTH[name]
     return cfg
 
 

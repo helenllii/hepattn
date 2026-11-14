@@ -108,6 +108,7 @@ def gmp_neighbourhood_3d(
     eta_max: float,
     depth_cell: float,
     depth_kernel_size: int | None = None,
+    depth_wildcard: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """gmp_neighbourhood with a third, non-periodic depth axis: the cell offsets on an (eta, phi, depth) grid.
 
@@ -127,6 +128,10 @@ def gmp_neighbourhood_3d(
         eta_max: Grid range in eta, [-eta_max, eta_max].
         depth_cell: Cell size in depth.
         depth_kernel_size: Odd kernel extent in depth, in cells; defaults to kernel_size.
+        depth_wildcard: If True, a token with a negative depth is at ANY depth: in a pair where either token has
+            depth < 0, the depth difference is ignored (dw = 0, the kernel's centre depth slice), in both directions,
+            so the neighbourhood stays symmetric. Used to let tracks (depth -1, CLICDataset gmp_track_depth "any")
+            interact with clusters at every depth. False (the default): a negative depth joins the first bin.
 
     Returns:
         neighbours: (B, K * N, N) bool, K = kernel_size**2 * depth_kernel_size; row o * N + i, column j is True when j is
@@ -148,6 +153,9 @@ def gmp_neighbourhood_3d(
     du = u.unsqueeze(-2) - u.unsqueeze(-1)  # (B, N_i, N_j)
     dv = torch.remainder(v.unsqueeze(-2) - v.unsqueeze(-1) + r, phi_cells) - r
     dw = w.unsqueeze(-2) - w.unsqueeze(-1)
+    if depth_wildcard:
+        wild = in_grid & (depth < 0)
+        dw = torch.where(wild.unsqueeze(-2) | wild.unsqueeze(-1), 0, dw)
     pairs = in_grid.unsqueeze(-1) & in_grid.unsqueeze(-2)
     offsets = [pairs & (du == a) & (dv == b) & (dw == c) for a in range(-r, r + 1) for b in range(-r, r + 1) for c in range(-rd, rd + 1)]
     return torch.cat(offsets, dim=-2), in_grid
@@ -163,6 +171,7 @@ class GeometricMessagePassing(nn.Module):
         eta_max: float = 5.2,
         depth_cell: float | None = None,
         depth_kernel_size: int | None = None,
+        depth_wildcard: bool = False,
     ) -> None:
         """Geometric message passing (GMP) after PHAT-JeT [2605.21789]: sum the tokens in each (eta, phi) cell, a depthwise
         k x k convolution over the grid, read back at each token's cell, then x + LayerNorm(Linear(.)), as the reference
@@ -182,6 +191,8 @@ class GeometricMessagePassing(nn.Module):
                 a depthwise Conv3d (k, k, depth_kernel_size) in place of the Conv2d. None (the default) is the 2D GMP,
                 unchanged: same modules, parameters, initialization and arithmetic.
             depth_kernel_size: 3D only: odd kernel extent in depth, in cells; defaults to kernel_size.
+            depth_wildcard: 3D only: tokens with a negative depth (tracks under gmp_track_depth "any") ignore the depth
+                difference to every other token (gmp_neighbourhood_3d). Geometry only: no parameter changes.
         """
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 == 0:
@@ -192,6 +203,8 @@ class GeometricMessagePassing(nn.Module):
             raise ValueError(f"GMP eta_cell and eta_max must be positive, got {eta_cell}, {eta_max}")
         if depth_cell is None and depth_kernel_size is not None:
             raise ValueError("GMP depth_kernel_size is a 3D setting: it needs depth_cell")
+        if depth_cell is None and depth_wildcard:
+            raise ValueError("GMP depth_wildcard is a 3D setting: it needs depth_cell")
         if depth_cell is not None:
             if depth_cell <= 0:
                 raise ValueError(f"GMP depth_cell must be positive, got {depth_cell}")
@@ -204,6 +217,7 @@ class GeometricMessagePassing(nn.Module):
         self.eta_max = eta_max
         self.depth_cell = depth_cell
         self.depth_kernel_size = depth_kernel_size
+        self.depth_wildcard = bool(depth_wildcard)
         # Number of kernel offsets K: the rows of the neighbours tensor are K blocks of N
         self.num_offsets = kernel_size**2 * (depth_kernel_size or 1)
         # Only the parameters of this depthwise conv are used (its weight[c, 0, du, dv] or [c, 0, du, dv, dw], flattened
@@ -220,6 +234,8 @@ class GeometricMessagePassing(nn.Module):
         geometry = {"kernel_size": self.kernel_size, "eta_cell": self.eta_cell, "phi_cells": self.phi_cells, "eta_max": self.eta_max}
         if self.depth_cell is not None:
             geometry |= {"depth_cell": self.depth_cell, "depth_kernel_size": self.depth_kernel_size}
+            if self.depth_wildcard:
+                geometry["depth_wildcard"] = True
         return geometry
 
     def forward(self, x: Tensor, neighbours: Tensor, in_grid: Tensor) -> Tensor:
@@ -530,7 +546,9 @@ class Encoder(nn.Module):
         # 3D GMP when depth_cell is set; the neighbourhood is built from the non-None geometry keys only, so a config
         # that spells out depth_cell: null is the 2D GMP and calls gmp_neighbourhood exactly as before
         self.gmp_coord_dims = 3 if gmp is not None and gmp.get("depth_cell") is not None else 2
-        self._gmp_kwargs = {k: v for k, v in gmp.items() if v is not None} if gmp is not None else None
+        # None-valued keys are dropped; so is depth_wildcard: false, so a 3D config without the wildcard calls
+        # gmp_neighbourhood_3d exactly as before
+        self._gmp_kwargs = {k: v for k, v in gmp.items() if v is not None and not (k == "depth_wildcard" and not v)} if gmp is not None else None
 
         # Initialize register tokens if specified
         if self.num_register_tokens is not None:
@@ -704,7 +722,9 @@ class Encoder(nn.Module):
             if self.gmp_coord_dims == 3:
                 neighbours, in_grid = gmp_neighbourhood_3d(x_coords[..., 0], x_coords[..., 1], x_coords[..., 2], valid, **self._gmp_kwargs)
             else:
-                neighbours, in_grid = gmp_neighbourhood(x_coords[..., 0], x_coords[..., 1], valid, **self._gmp_kwargs)
+                # Only the 2D geometry keys: a 2D config may still spell out e.g. depth_wildcard: false
+                kw2d = {k: self._gmp_kwargs[k] for k in ("kernel_size", "eta_cell", "phi_cells", "eta_max") if k in self._gmp_kwargs}
+                neighbours, in_grid = gmp_neighbourhood(x_coords[..., 0], x_coords[..., 1], valid, **kw2d)
             gmp_geometry = (neighbours.to(x.dtype), in_grid)
 
         x = x.view(batch_size, num_patches, self.patch_size, dim)

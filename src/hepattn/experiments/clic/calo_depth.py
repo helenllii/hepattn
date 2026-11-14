@@ -24,6 +24,11 @@ import numpy as np
 R_FRONT = 1502.186  # mm, barrel front face (track_x/y/z_int, verified in analysis/gmp_implementation_20261020)
 Z_FRONT = 2309.0  # mm, endcap front face
 MODES = ("envelope", "projective", "compartment")
+# Track depth sentinel for the track-depth ablation (CLICDataset gmp_track_depth "any"): a negative depth that GMP with
+# depth_wildcard treats as "every depth" (track-cluster pairs ignore the depth difference). Clusters are never negative:
+# every mode above returns >= 0.
+ANY_DEPTH = -1.0
+TRACK_DEPTH_MODES = ("front", "any")
 
 
 def depth_envelope(x, y, z):

@@ -9,8 +9,8 @@ from lightning import seed_everything
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from hepattn.experiments.clic.calo_depth import ANY_DEPTH, TRACK_DEPTH_MODES, topo_depth
 from hepattn.experiments.clic.calo_depth import MODES as DEPTH_MODES
-from hepattn.experiments.clic.calo_depth import topo_depth
 from hepattn.utils.scaling import FeatureScaler
 
 
@@ -44,6 +44,7 @@ class CLICDataset(Dataset):
         is_inference: bool = False,
         dummy_data: bool = False,
         gmp_depth: str | None = None,
+        gmp_track_depth: str = "front",
     ):
         """CLIC particle-flow dataset.
 
@@ -51,13 +52,21 @@ class CLICDataset(Dataset):
             calo_depth.topo_depth with this mode ("envelope", "projective" or "compartment"); tracks get 0 (their
             position is their intersection with the calorimeter front face). None (the default) changes nothing.
 
+        gmp_track_depth: Depth given to tracks when gmp_depth is set. "front" (the default, the initial 3D baseline):
+            0, their intersection with the calorimeter front face. "any": calo_depth.ANY_DEPTH (-1), which a 3D GMP with
+            depth_wildcard treats as every depth (the track-depth ablation). Ignored without gmp_depth.
+
         Raises:
-            ValueError: If gmp_depth is not None or one of calo_depth.MODES.
+            ValueError: If gmp_depth is not None or one of calo_depth.MODES, or gmp_track_depth is not one of
+                calo_depth.TRACK_DEPTH_MODES.
         """
         super().__init__()
         if gmp_depth is not None and gmp_depth not in DEPTH_MODES:
             raise ValueError(f"gmp_depth must be one of {DEPTH_MODES} or None, got {gmp_depth!r}")
         self.gmp_depth = gmp_depth
+        if gmp_track_depth not in TRACK_DEPTH_MODES:
+            raise ValueError(f"gmp_track_depth must be one of {TRACK_DEPTH_MODES}, got {gmp_track_depth!r}")
+        self.gmp_track_depth = gmp_track_depth
 
         self.sampling_seed = 42
         np.random.default_rng(self.sampling_seed)
@@ -418,7 +427,8 @@ class CLICDataset(Dataset):
         if self.gmp_depth is not None:
             # 3D GMP depth (calo_depth): 0 for tracks, which sit on the calorimeter front face
             topo_depth_calo = self.full_data_array["topo_depth_calo"][topo_start:topo_end]
-            node_raw_features["depth_calo"] = torch.cat([torch.zeros(n_tracks, dtype=torch.float32), topo_depth_calo.float()], -1)
+            track_depth = ANY_DEPTH if self.gmp_track_depth == "any" else 0.0
+            node_raw_features["depth_calo"] = torch.cat([torch.full((n_tracks,), track_depth, dtype=torch.float32), topo_depth_calo.float()], -1)
 
         for key, val in node_raw_features.items():
             val = do_padding(val, self.max_nodes)

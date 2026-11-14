@@ -68,3 +68,30 @@ def test_depth_is_opt_in_and_matches_raw_branches(baseline, mode):
         want = calo_depth.topo_depth(mode, *(raw[k][ev] for k in branches))
         np.testing.assert_allclose(depth[nt : nt + nc].numpy(), want, rtol=1e-5, atol=1e-3)
         assert torch.all(depth >= 0)
+
+
+def test_track_depth_any_sets_tracks_to_the_sentinel():
+    """gmp_track_depth "any": tracks at calo_depth.ANY_DEPTH, clusters and every other input exactly as with "front"."""
+    front, anyd = (
+        _dataset("envelope"),
+        CLICDataset(
+            filepath=str(VAL),
+            inputs={"hit": ["x"]},
+            targets={"particle": ["e", "pt", "eta", "sinphi", "cosphi"]},
+            scale_dict_path=str(SCALE),
+            num_events=N_EVENTS,
+            incidence_cutval=0.01,
+            gmp_depth="envelope",
+            gmp_track_depth="any",
+        ),
+    )
+    for i in (0, len(front) // 2, len(front) - 1):
+        (inp_f, tgt_f), (inp_a, tgt_a) = front[i], anyd[i]
+        nt = int(front.n_tracks[i])
+        assert torch.all(inp_a["node_depth_calo"][:nt] == calo_depth.ANY_DEPTH)
+        assert torch.equal(inp_a["node_depth_calo"][nt:], inp_f["node_depth_calo"][nt:])
+        for k in inp_f:
+            if k != "node_depth_calo":
+                torch.testing.assert_close(inp_a[k], inp_f[k], rtol=0, atol=0, equal_nan=True, msg=k)
+        for k in tgt_f:
+            torch.testing.assert_close(tgt_a[k], tgt_f[k], rtol=0, atol=0, equal_nan=True, msg=k)
