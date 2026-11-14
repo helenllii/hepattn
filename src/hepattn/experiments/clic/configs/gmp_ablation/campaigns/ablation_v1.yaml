@@ -1,0 +1,28 @@
+# GMP ablation campaign v1: every run is ONE model on 4 x A100 of one node via DDP (micro-batch 256 x 4 GPUs x
+# accumulate 1 = 1024, bf16, compile), runs execute strictly one after another in the order below, chained with PBS
+# afterok (gmp_ablation/campaign.py; submit_gmp_run.sh per job). Recipe, data split, evaluation and the 6-block
+# weights-first GMP are fixed by configs/gmp_ablation/sweep/common.yaml and the arm files (gmp_ablation/sweep.py).
+#
+# PENDING THE USER'S DECISION (see gmp_ablation/CAMPAIGN.md): queue, walltime and epochs_per_job. `submit` refuses to
+# run while queue or walltime is null. Nothing in this file has been submitted.
+name: ablation_v1
+epochs: 10
+queue: null
+walltime: null
+epochs_per_job: null
+
+runs:
+  # A. track depth (production eta/phi grid 0.2 / 32 cells, kernel 3; 3D: envelope depth, 200 mm bins, kernel 3x3x3)
+  - {arm: g2d_e020, seed: 42}              # 2D baseline
+  - {arm: g3d_env_dz200, seed: 42}         # 3D, tracks at depth 0
+  - {arm: g3d_env_dz200_trkany, seed: 42}  # 3D, track-cluster pairs ignore depth
+  - {arm: g2d_e020, seed: 43}              # second seed of A: run-to-run spread
+  - {arm: g3d_env_dz200, seed: 43}
+  - {arm: g3d_env_dz200_trkany, seed: 43}
+  # B. grid size (2D eta/phi resolution; 3D depth-bin width), tracks at depth 0
+  - {arm: g2d_e010, seed: 42}              # eta 0.1 / 64 phi cells
+  - {arm: g2d_e040, seed: 42}              # eta 0.4 / 16 phi cells
+  - {arm: g3d_env_dz100, seed: 42}
+  - {arm: g3d_env_dz400, seed: 42}
+  # C. placement: GMP in block 0 only (the all-6-blocks arm is A's g2d_e020)
+  - {arm: g2d_e020_early, seed: 42}
