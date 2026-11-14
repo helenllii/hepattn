@@ -8,6 +8,8 @@
 #        segment 2: resumes from epoch 0's checkpoint, trains epoch 1, verdict 0, DONE.json.
 #      This exercises the config preflight, DDPGuard in the live process group, checkpoint/resume, SegmentStop, the
 #      verdict and the DONE marker, and measures the validation time per epoch at 4 GPUs.
+#   3. resume_check.py: segment 2's restored state (ResumeAudit) == segment 1's checkpoint (weights, optimizer,
+#      scheduler, global step, epoch); every logged LR == one uninterrupted OneCycleLR; epochs 0 and 1 trained once each.
 #
 #   qsub submit_gmp_smoke.sh          # from src/hepattn/experiments/clic of a CLEAN checkout (the commit is pinned)
 # NEVER put a trailing comment on a #PBS line: qsub parses the rest of the line as arguments.
@@ -57,5 +59,12 @@ for seg in 1 2; do
   echo "==> segment ${seg} exit $? $(date -Is)" | tee -a "${OUT}/job.log"
 done
 ls "${RUN}" "${RUN}/segments" 2>/dev/null | tee -a "${OUT}/job.log"
+# 3. the resume was exact: restored state == checkpoint, one continuous LR schedule, every epoch once
+(
+  set +u; eval "$(~/.pixi/bin/pixi shell-hook --manifest-path "${ENV_REPO}/pyproject.toml" -e clic --as-is)"; set -u
+  export PYTHONNOUSERSITE=1
+  python "${CODE}/src/hepattn/experiments/clic/gmp_ablation/resume_check.py" "${RUN}" --epochs 2 2>&1 | tee "${OUT}/resume_check.txt"
+  echo "==> resume check exit ${PIPESTATUS[0]} $(date -Is)" | tee -a "${OUT}/job.log"
+)
 [ -f "${RUN}/DONE.json" ] && echo "==> smoke DONE" | tee -a "${OUT}/job.log"
 echo "==> done $(date -Is)" | tee -a "${OUT}/job.log"

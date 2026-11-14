@@ -54,6 +54,8 @@ trainer:
       init_args:
         refresh_rate: 200
     - class_path: hepattn.experiments.clic.gmp_ablation.segment.SegmentStop
+    # the state a job starts from (after a checkpoint restore): global step, epoch, weight/optimizer sums, scheduler, LR
+    - class_path: hepattn.experiments.clic.gmp_ablation.resume_audit.ResumeAudit
     # parameter counts, real dtypes, NaN/inf counts, per-epoch time / steps/s / peak memory -> $GMP_DIAG_OUT
     - class_path: hepattn.experiments.clic.gmp_ablation.diagnostics.GMPDiagnostics
 
