@@ -33,6 +33,9 @@ trainer:
       init_args:
         monitor: val/loss
         save_last: true
+        # hepattn's Checkpoint uploads each checkpoint to Comet when log_model is true (its default); the sweep logs to
+        # CSV, whose writer has no log_model, so every pilot arm crashed after saving its checkpoint (job 7843955).
+        log_model: false
     - class_path: lightning.pytorch.callbacks.ModelSummary
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor
     - class_path: lightning.pytorch.callbacks.TQDMProgressBar

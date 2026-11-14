@@ -204,11 +204,14 @@ class GMPDiagnostics(Callback):
         if torch.cuda.is_available():
             rec |= {"peak_alloc_gib": torch.cuda.max_memory_allocated() / gib, "peak_reserved_gib": torch.cuda.max_memory_reserved() / gib}
         self._res["epochs"].append(rec)
+        self._snapshot_health()
         self._write(trainer)
         if trainer.is_global_zero:
             print(f"[gmp-diag] epoch {json.dumps(rec)}", flush=True)
 
-    def on_train_end(self, trainer, pl_module) -> None:
+    def _snapshot_health(self) -> None:
+        """Copy the GPU health counters into the record (one host sync). Called at every epoch end and at train end,
+        so a run that dies after an epoch (e.g. in a later callback) keeps its health record (job 7843955 lost it)."""
         if self._health is not None:
             steps, bad_loss, bad_grad, gmax = self._health.tolist()
             self._res["health"] = {
@@ -217,6 +220,9 @@ class GMPDiagnostics(Callback):
                 "nonfinite_grad_steps": int(bad_grad),
                 "max_finite_preclip_grad_norm": gmax,
             }
+
+    def on_train_end(self, trainer, pl_module) -> None:
+        self._snapshot_health()
         path = self._write(trainer)
         if trainer.is_global_zero:
             print(f"[gmp-diag] health {json.dumps(self._res.get('health'))} -> {path}", flush=True)
