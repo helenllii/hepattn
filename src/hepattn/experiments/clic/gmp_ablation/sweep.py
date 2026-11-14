@@ -3,7 +3,8 @@
 Every arm is the PHAT16 encoder of configs/bench3 (dim 256, 6 patch blocks, 16 heads, ...) on top of base.yaml and
 configs/gmp_ablation/sweep/common.yaml, with ONE thing varied: the `gmp` geometry (2D cell sizes; 3D depth definition
 and depth cell), and -- as a separate, controlled factor -- the placement (`gmp_layers`). Backend, recipe, data split,
-batch, seed and budget are fixed by common.yaml and the launcher (submit_gmp_sweep.sh).
+batch, seed and budget are fixed by common.yaml and the per-run 4-GPU DDP launcher (submit_gmp_run.sh, chained by
+campaign.py). The pilot launcher that ran 4 arms per node at 1 GPU each (submit_gmp_sweep.sh, job 7843955) is retired.
 
     python -m hepattn.experiments.clic.gmp_ablation.sweep write-configs      # regenerate configs/gmp_ablation/sweep/
     python -m hepattn.experiments.clic.gmp_ablation.sweep summarize <campaign dir> [--geometry geometry_study.json]
@@ -99,25 +100,51 @@ def write_configs(out: Path = SWEEP_DIR) -> list[Path]:
 
 # ------------------------------------------------------------------------------------------------------- summary
 def _metrics(run: Path) -> dict:
-    files = sorted(run.rglob("metrics.csv"))
+    """Training/validation metrics of a run, merged over every CSV log of it (a resumed or segmented run writes one per
+    attempt, version_0, version_1, ...); for a repeated epoch the later attempt wins.
+    """
+    files = sorted(run.rglob("metrics.csv"), key=lambda f: (f.stat().st_mtime, str(f)))
     if not files:
         return {}
-    rows = list(csv.DictReader(files[-1].open()))
     out: dict = {"val": [], "train_loss_last": None}
-    train = [float(r["train/loss"]) for r in rows if r.get("train/loss")]
+    train: list = []
+    val_by_epoch: dict = {}
+    for f in files:
+        for r in csv.DictReader(f.open()):
+            if r.get("train/loss"):
+                train.append(float(r["train/loss"]))
+            vals = {k: float(v) for k, v in r.items() if k.startswith("val/") and v not in {"", None}}
+            if vals:
+                val_by_epoch[int(float(r.get("epoch") or 0))] = vals
     if train:
         tail = train[-max(1, len(train) // 10) :]
         out["train_loss_last"] = sum(tail) / len(tail)
-    for r in rows:
-        vals = {k: float(v) for k, v in r.items() if k.startswith("val/") and v not in {"", None}}
-        if vals:
-            out["val"].append({"epoch": int(float(r.get("epoch") or 0)), **vals})
+    out["val"] = [{"epoch": e, **v} for e, v in sorted(val_by_epoch.items())]
     return out
 
 
 def _diag(run: Path) -> dict:
-    files = sorted(run.rglob("*.rank0.json"))
-    return json.loads(files[-1].read_text()) if files else {}
+    """GMPDiagnostics of a run, merged over its attempts: epochs concatenated (a repeated epoch: the later attempt wins),
+    non-finite counts summed, parameters from the latest attempt.
+    """
+    files = sorted(run.rglob("*.rank0.json"), key=lambda f: (f.stat().st_mtime, str(f)))
+    if not files:
+        return {}
+    recs = [json.loads(f.read_text()) for f in files]
+    merged = dict(recs[-1])
+    epochs = {}
+    for r in recs:
+        for e in r.get("epochs", []):
+            epochs[e["epoch"]] = e
+    merged["epochs"] = [epochs[k] for k in sorted(epochs)]
+    healths = [r["health"] for r in recs if r.get("health")]
+    if healths:
+        merged["health"] = {
+            "nonfinite_loss_batches": sum(h.get("nonfinite_loss_batches", 0) for h in healths),
+            "nonfinite_grad_steps": sum(h.get("nonfinite_grad_steps", 0) for h in healths),
+            "max_finite_preclip_grad_norm": max(h.get("max_finite_preclip_grad_norm", 0.0) for h in healths),
+        }
+    return merged
 
 
 def summarize(campaign: Path, geometry: Path | None = None) -> str:
@@ -128,8 +155,12 @@ def summarize(campaign: Path, geometry: Path | None = None) -> str:
         "| val/loss by epoch | key val metrics (last epoch) |"
     )
     lines += [head, "|" + "---|" * 10]
-    for run in sorted(p for p in campaign.iterdir() if p.is_dir() and (p / "arm.txt").exists()):
-        arm = (run / "arm.txt").read_text().strip()
+    # pilot layout: <campaign>/<arm>/arm.txt; campaign layout (campaign.py): <campaign>/runs/<NN>_<arm>_s<seed>/
+    runs = [p for p in campaign.iterdir() if p.is_dir() and (p / "arm.txt").exists()]
+    if (campaign / "runs").is_dir():
+        runs += [p for p in (campaign / "runs").iterdir() if p.is_dir()]
+    for run in sorted(runs):
+        arm = (run / "arm.txt").read_text().strip() if (run / "arm.txt").exists() else run.name
         d, m = _diag(run), _metrics(run)
         ep = d.get("epochs", [])
         last = m.get("val", [])[-1] if m.get("val") else {}
