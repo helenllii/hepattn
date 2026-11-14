@@ -7,6 +7,9 @@ A campaign spec (configs/gmp_ablation/campaigns/<name>.yaml) lists runs (arm x s
     queue: null             # REQUIRED to submit; deliberately unset until the user chooses the queue
     walltime: null          # per job, "HH:MM:SS"; REQUIRED to submit
     epochs_per_job: null    # null: one job per run; N: split each run into checkpointed jobs of <= N epochs
+    chain: null             # REQUIRED to submit: "full" (all jobs queued at once, chained afterok; needs a queue that
+                            # allows that many queued jobs) or "rolling" (only the first job is queued; each running job
+                            # submits its successor with afterok on itself: at most 2 campaign jobs in the queue)
     runs:
       - {arm: g2d_e020, seed: 42}
       - ...
@@ -37,6 +40,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -126,7 +130,9 @@ def run(cmd: list[str], **kw) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout.strip()
 
 
-def qsub_command(job: dict, spec: dict, code: Path, commit: str, run_dir: Path, pbs_dir: Path, after: str | None) -> list[str]:
+def qsub_command(
+    job: dict, spec: dict, code: Path, commit: str, run_dir: Path, pbs_dir: Path, after: str | None, manifest: Path | None = None
+) -> list[str]:
     env = {
         "CODE": str(code),
         "EXPECTED_COMMIT": commit,
@@ -138,6 +144,8 @@ def qsub_command(job: dict, spec: dict, code: Path, commit: str, run_dir: Path, 
     }
     if job["stop_at_epoch"]:
         env["STOP_AT_EPOCH"] = str(job["stop_at_epoch"])
+    if manifest is not None:  # rolling chain: the job submits its own successor (campaign.py advance)
+        env["CAMPAIGN_MANIFEST"] = str(manifest)
     for k, v in env.items():
         if "," in v:
             raise ValueError(f"{k}={v!r}: qsub -v cannot carry commas")
@@ -184,8 +192,8 @@ def live_jobs(job_ids: list[str]) -> list[str]:
 
 def submit(spec_path: Path, repo: Path, dry_run: bool, resume: bool) -> None:
     spec = load_spec(spec_path)
-    if not dry_run and (not spec.get("queue") or not spec.get("walltime")):
-        raise SystemExit("refusing: the spec's queue and walltime are unset; choose them first (see CAMPAIGN.md)")
+    if not dry_run and (not spec.get("queue") or not spec.get("walltime") or not spec.get("chain")):
+        raise SystemExit("refusing: the spec's queue, walltime and chain are not all set; choose them first (see CAMPAIGN.md)")
     spec.setdefault("queue", "<QUEUE>")
     spec.setdefault("walltime", "<HH:MM:SS>")
     spec["queue"] = spec["queue"] or "<QUEUE>"
@@ -223,24 +231,95 @@ def submit(spec_path: Path, repo: Path, dry_run: bool, resume: bool) -> None:
         pbs_dir.mkdir(parents=True, exist_ok=True)
         (cdir / "runs").mkdir(exist_ok=True)
         (cdir / "spec.yaml").write_text(spec_path.read_text())
+    rolling = spec.get("chain") == "rolling"
+    if (spec.get("chain") or "full") not in {"full", "rolling"}:
+        raise SystemExit(f"chain must be 'full' or 'rolling', got {spec.get('chain')!r}")
+    manifest["chain"] = "rolling" if rolling else "full"
     prev = None
+    submitted = 0
     for entry in manifest["jobs"]:
         run_dir = Path(entry["run_dir"])
         if is_finished(entry, run_dir):
             print(f"  {entry['job_name']:<16s} {entry['run_id']}: already finished, not resubmitted")
             continue
-        cmd = qsub_command(entry, spec, code, commit, run_dir, pbs_dir, prev)
+        if rolling and submitted:
+            print(f"  {entry['job_name']:<16s} {entry['run_id']}: submitted later by the running job (rolling afterok)")
+            continue
+        submitted += 1
+        cmd = qsub_command(entry, spec, code, commit, run_dir, pbs_dir, prev, manifest_path if rolling else None)
         if dry_run:
             print("  " + " ".join(cmd))
             prev = f"<job of {entry['job_name']}>"
             continue
         jid = run(cmd)
         entry["attempts"].append({"job_id": jid, "after": prev, "submitted": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "command": cmd})
-        manifest_path.write_text(json.dumps(manifest, indent=1))  # after every qsub: never lose a job id
+        write_manifest(manifest_path, manifest)  # after every qsub: never lose a job id
         print(f"  {entry['job_name']:<16s} {entry['run_id']:<28s} {jid}{f'  afterok:{prev}' if prev else ''}")
         prev = jid
     if not dry_run:
+        (cdir / "STALLED.json").unlink(missing_ok=True)
         print(f"manifest: {manifest_path}")
+
+
+def write_manifest(path: Path, manifest: dict) -> None:
+    """Atomic replace, so `status` never reads a half-written manifest."""
+    tmp = path.with_suffix(f".tmp{time.time_ns()}")
+    tmp.write_text(json.dumps(manifest, indent=1))
+    tmp.replace(path)
+
+
+def _base(job_id: str) -> str:
+    return job_id.split(".", maxsplit=1)[0]
+
+
+def advance(manifest_path: Path, job_id: str) -> int:
+    """Rolling chain: called by the RUNNING job `job_id`; submits the next unfinished job with afterok:<job_id>.
+
+    Idempotent (called after the preflight and again after a successful verdict): if the next job already has a live
+    attempt, nothing is submitted. Only the running job writes the manifest (the queue runs one campaign job at a
+    time). Returns 0, or 1 if qsub failed, in which case STALLED.json records why (`status` shows it; `submit --resume`
+    continues the campaign after the running job).
+    """
+    manifest = json.loads(manifest_path.read_text())
+    cdir = manifest_path.parent
+    jobs = manifest["jobs"]
+    mine = [i for i, e in enumerate(jobs) if any(_base(a["job_id"]) == _base(job_id) for a in e["attempts"])]
+    if not mine:
+        print(f"[campaign advance] job {job_id} is not in {manifest_path}: nothing to do")
+        return 0
+    k = mine[-1]
+    nxt = next((i for i in range(k + 1, len(jobs)) if not is_finished(jobs[i], Path(jobs[i]["run_dir"]))), None)
+    if nxt is None:
+        print(f"[campaign advance] {jobs[k]['run_id']} is the last unfinished job of the campaign")
+        return 0
+    entry = jobs[nxt]
+    if entry["attempts"] and live_jobs([entry["attempts"][-1]["job_id"]]):
+        print(f"[campaign advance] {entry['run_id']} already submitted: {entry['attempts'][-1]['job_id']}")
+        return 0
+    spec = manifest["spec"]
+    cmd = qsub_command(entry, spec, Path(manifest["code"]), manifest["commit"], Path(entry["run_dir"]), cdir / "pbs", job_id, manifest_path)
+    try:
+        jid = run(cmd)
+    except subprocess.CalledProcessError as e:
+        (cdir / "STALLED.json").write_text(
+            json.dumps(
+                {"after_job": job_id, "next": entry["run_id"], "error": (e.stderr or str(e)).strip(), "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
+                indent=1,
+            )
+        )
+        print(f"[campaign advance] qsub of {entry['run_id']} FAILED: {(e.stderr or e).strip() if e.stderr else e}")
+        return 1
+    entry["attempts"].append({
+        "job_id": jid,
+        "after": job_id,
+        "submitted": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "command": cmd,
+        "submitted_by": job_id,
+    })
+    write_manifest(manifest_path, manifest)
+    (cdir / "STALLED.json").unlink(missing_ok=True)
+    print(f"[campaign advance] submitted {entry['run_id']}: {jid} (afterok:{job_id})")
+    return 0
 
 
 def is_finished(entry: dict, run_dir: Path) -> bool:
@@ -297,17 +376,24 @@ def status(spec_path: Path) -> None:
         run_dir = Path(entry["run_dir"])
         att = entry["attempts"][-1] if entry["attempts"] else None
         state = qstat_state(att["job_id"]) if att else {}
-        label = classify(state, is_finished(entry, run_dir)) if att else ("completed" if is_finished(entry, run_dir) else "not submitted")
+        not_yet = "not submitted yet (the running job submits it)" if manifest.get("chain") == "rolling" else "not submitted"
+        label = classify(state, is_finished(entry, run_dir)) if att else ("completed" if is_finished(entry, run_dir) else not_yet)
         if label == "running":
             current = entry
         jid = att["job_id"].split(".")[0] if att else "-"
         print(f"  {entry['job_name']:<16s} {entry['run_id']:<28s} {jid:<9s} {label}  {run_dir}")
     print(f"currently running: {current['run_id'] if current else 'none'}")
+    stalled = CAMPAIGNS / spec["name"] / "STALLED.json"
+    if stalled.exists():
+        print(f"STALLED: {stalled.read_text().strip()}\n  -> after the running job ends: campaign.py submit --resume <spec>")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+    adv = sub.add_parser("advance", help="(called by a running job) submit the next job of a rolling chain")
+    adv.add_argument("manifest", type=Path)
+    adv.add_argument("--job", required=True)
     for name in ("plan", "submit", "status"):
         s = sub.add_parser(name)
         s.add_argument("spec", type=Path)
@@ -316,6 +402,8 @@ def main() -> None:
             s.add_argument("--resume", action="store_true", help="re-chain from the first unfinished job after a failure")
             s.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[5])
     args = p.parse_args()
+    if args.cmd == "advance":
+        sys.exit(advance(args.manifest, args.job))
     if args.cmd == "plan":
         print(plan_text(load_spec(args.spec)))
     elif args.cmd == "submit":

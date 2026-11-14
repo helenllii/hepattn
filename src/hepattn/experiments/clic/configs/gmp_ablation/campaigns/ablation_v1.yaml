@@ -3,13 +3,14 @@
 # afterok (gmp_ablation/campaign.py; submit_gmp_run.sh per job). Recipe, data split, evaluation and the 6-block
 # weights-first GMP are fixed by configs/gmp_ablation/sweep/common.yaml and the arm files (gmp_ablation/sweep.py).
 #
-# PENDING THE USER'S DECISION (see gmp_ablation/CAMPAIGN.md): queue, walltime and epochs_per_job. `submit` refuses to
-# run while queue or walltime is null. Nothing in this file has been submitted.
+# PENDING THE USER'S DECISION (see gmp_ablation/CAMPAIGN.md): queue, walltime, chain and epochs_per_job. `submit`
+# refuses to run while queue, walltime or chain is null. Nothing in this file has been submitted.
 name: ablation_v1
 epochs: 10
 queue: null
 walltime: null
 epochs_per_job: null
+chain: null   # "full" or "rolling" (see gmp_ablation/campaign.py); pending with the queue
 
 runs:
   # A. track depth (production eta/phi grid 0.2 / 32 cells, kernel 3; 3D: envelope depth, 200 mm bins, kernel 3x3x3)

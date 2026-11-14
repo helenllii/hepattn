@@ -34,7 +34,7 @@ SPEC = CLIC / "configs/gmp_ablation/campaigns/ablation_v1.yaml"
 # ------------------------------------------------------------------------------------------------------- the spec
 def test_shipped_spec_is_complete_and_pending():
     spec = campaign.load_spec(SPEC)
-    assert spec["queue"] is None and spec["walltime"] is None  # the user's decision, deliberately unset
+    assert spec["queue"] is None and spec["walltime"] is None and spec["chain"] is None  # the user's decision, unset
     assert len(spec["runs"]) == 11 and spec["epochs"] == 10
     for r in spec["runs"]:
         assert (CLIC / "configs/gmp_ablation/sweep" / f"{r['arm']}.yaml").exists(), r
@@ -101,18 +101,24 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(campaign, "pin_code", lambda _repo, _name: (tmp_path / "snap", "c0ffee" * 6 + "c0ff"))
     states = {}
     monkeypatch.setattr(campaign, "qstat_state", lambda jid: states.get(jid, {}))
-    spec = yaml.safe_load(SPEC.read_text()) | {"queue": "QQ", "walltime": "02:00:00", "runs": yaml.safe_load(SPEC.read_text())["runs"][:3]}
+    spec = yaml.safe_load(SPEC.read_text()) | {
+        "queue": "QQ",
+        "walltime": "02:00:00",
+        "chain": "full",
+        "runs": yaml.safe_load(SPEC.read_text())["runs"][:3],
+    }
     p = tmp_path / "spec.yaml"
     p.write_text(yaml.safe_dump(spec))
     return p, submitted, states, tmp_path
 
 
-def test_submit_refuses_unset_queue(sandbox, tmp_path):
+@pytest.mark.parametrize("unset", ["queue", "walltime", "chain"])
+def test_submit_refuses_unset_choices(sandbox, tmp_path, unset):
     p, submitted, _, _ = sandbox
-    spec = yaml.safe_load(p.read_text()) | {"queue": None}
+    spec = yaml.safe_load(p.read_text()) | {unset: None}
     q = tmp_path / "noq.yaml"
     q.write_text(yaml.safe_dump(spec))
-    with pytest.raises(SystemExit, match="unset"):
+    with pytest.raises(SystemExit, match="not all set"):
         campaign.submit(q, Path("/repo"), dry_run=False, resume=False)
     assert not submitted
 
@@ -277,3 +283,89 @@ def test_shared_config_sets_ddp_execution():
 )
 def test_runcheck_verdict(diag, stop, code):
     assert runcheck.verdict(diag, epochs=10, stop_at=stop)[0] == code
+
+
+# ------------------------------------------------------------------------------------------ rolling afterok chain
+@pytest.fixture
+def rolling(sandbox):
+    p, submitted, states, tmp = sandbox
+    spec = yaml.safe_load(p.read_text()) | {"chain": "rolling", "queue": "capacity", "walltime": "02:00:00"}
+    p.write_text(yaml.safe_dump(spec))
+    return p, submitted, states, tmp
+
+
+def test_rolling_submit_only_first_job(rolling):
+    p, submitted, _, tmp = rolling
+    campaign.submit(p, Path("/repo"), dry_run=False, resume=False)
+    assert len(submitted) == 1 and "-W" not in submitted[0]
+    man_path = tmp / "campaigns/ablation_v1/manifest.json"
+    assert f"CAMPAIGN_MANIFEST={man_path}" in submitted[0][submitted[0].index("-v") + 1]
+    man = json.loads(man_path.read_text())
+    assert man["chain"] == "rolling" and [len(j["attempts"]) for j in man["jobs"]] == [1, 0, 0]
+
+
+def test_rolling_advance_chains_idempotently(rolling):
+    p, submitted, states, tmp = rolling
+    campaign.submit(p, Path("/repo"), dry_run=False, resume=False)
+    man_path = tmp / "campaigns/ablation_v1/manifest.json"
+    # job 9001 (run 0) is running: it submits run 1 with afterok on itself
+    states["9001.pbs"] = {"job_state": "R"}
+    assert campaign.advance(man_path, "9001.pbs") == 0
+    assert submitted[1][submitted[1].index("-W") + 1] == "depend=afterok:9001.pbs"
+    # the second call (after a successful verdict) sees the live successor and does nothing
+    states["9002.pbs"] = {"job_state": "H", "depend": "afterok:9001.pbs"}
+    assert campaign.advance(man_path, "9001.pbs") == 0
+    assert len(submitted) == 2
+    # run 1 runs; run 2 already DONE (e.g. an earlier resume) -> nothing after it, nothing submitted
+    man = json.loads(man_path.read_text())
+    Path(man["jobs"][2]["run_dir"]).mkdir(parents=True)
+    (Path(man["jobs"][2]["run_dir"]) / "DONE.json").write_text("{}")
+    states["9002.pbs"] = {"job_state": "R"}
+    assert campaign.advance(man_path, "9002.pbs") == 0
+    assert len(submitted) == 2
+    man = json.loads(man_path.read_text())
+    assert [len(j["attempts"]) for j in man["jobs"]] == [1, 1, 0]
+    assert man["jobs"][1]["attempts"][0]["after"] == "9001.pbs"
+
+
+def test_rolling_advance_records_a_stall(rolling, monkeypatch):
+    p, submitted, states, tmp = rolling
+    campaign.submit(p, Path("/repo"), dry_run=False, resume=False)
+    man_path = tmp / "campaigns/ablation_v1/manifest.json"
+    real_run = campaign.run
+
+    def refuse(cmd, **kw):
+        if cmd[0] == "qsub":
+            raise campaign.subprocess.CalledProcessError(38, cmd, stderr="qsub: would exceed queue generic's per-project limit")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(campaign, "run", refuse)
+    assert campaign.advance(man_path, "9001.pbs") == 1
+    stall = json.loads((tmp / "campaigns/ablation_v1/STALLED.json").read_text())
+    assert stall["after_job"] == "9001.pbs" and "per-project limit" in stall["error"]
+    # after run 0 finishes (DONE), --resume continues from run 1 (no dependency) and clears the stall marker
+    monkeypatch.setattr(campaign, "run", real_run)
+    man = json.loads(man_path.read_text())
+    Path(man["jobs"][0]["run_dir"]).mkdir(parents=True)
+    (Path(man["jobs"][0]["run_dir"]) / "DONE.json").write_text("{}")
+    states.clear()
+    campaign.submit(p, Path("/repo"), dry_run=False, resume=True)
+    assert "-W" not in submitted[-1] and "ARM=g3d_env_dz200" in submitted[-1][submitted[-1].index("-v") + 1]
+    assert not (tmp / "campaigns/ablation_v1/STALLED.json").exists()
+
+
+def test_advance_unknown_job_is_a_noop(rolling):
+    p, submitted, _, tmp = rolling
+    campaign.submit(p, Path("/repo"), dry_run=False, resume=False)
+    assert campaign.advance(tmp / "campaigns/ablation_v1/manifest.json", "424242.pbs") == 0
+    assert len(submitted) == 1
+
+
+def test_advance_cli_exits_with_the_advance_status(rolling, monkeypatch):
+    """`campaign.py advance` (what submit_gmp_run.sh calls) runs and exits with advance()'s code."""
+    p, submitted, _, tmp = rolling
+    campaign.submit(p, Path("/repo"), dry_run=False, resume=False)
+    monkeypatch.setattr(campaign.sys, "argv", ["campaign.py", "advance", str(tmp / "campaigns/ablation_v1/manifest.json"), "--job", "9001.pbs"])
+    with pytest.raises(SystemExit) as e:
+        campaign.main()
+    assert e.value.code == 0 and len(submitted) == 2

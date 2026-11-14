@@ -7,7 +7,8 @@
 # Required (-v): CODE (pinned code checkout), EXPECTED_COMMIT, RUN_DIR (this arm/seed's own directory), ARM, SEED,
 #   EPOCHS (the run's total budget = trainer.max_epochs, which the LR schedule spans).
 # Optional (-v): STOP_AT_EPOCH (end this JOB after epoch STOP_AT_EPOCH-1: a segment of a split run),
-#   LIMIT_TRAIN_BATCHES (smoke tests only), CAMPAIGN, ATTEMPT_TAG and JOB_START (several invocations in one job).
+#   LIMIT_TRAIN_BATCHES (smoke tests only), CAMPAIGN, ATTEMPT_TAG and JOB_START (several invocations in one job),
+#   CAMPAIGN_MANIFEST (rolling chain: after the preflight passes, submit the next run with afterok on this job).
 #
 # Guarantees, all checked before any training step (exit codes: 10 code/commit, 11 GPUs, 12 import path, 13 config
 # preflight, 14 a concurrent job owns RUN_DIR):
@@ -103,6 +104,14 @@ python "${TOOLS}/preflight.py" "${A}/resolved.yaml" --arm-config "configs/gmp_ab
   | tee "${A}/preflight.txt"
 [ "${PIPESTATUS[0]}" -eq 0 ] || exit 13
 
+# ---- rolling chain (capacity queue: at most 2 campaign jobs queued+running): submit the successor now, with afterok on
+# THIS job, so it waits in H while this one trains and is deleted by PBS if this one fails. Idempotent; retried below.
+advance() {
+  [ -n "${CAMPAIGN_MANIFEST:-}" ] || return 0
+  python "${TOOLS}/campaign.py" advance "${CAMPAIGN_MANIFEST}" --job "${PBS_JOBID:-local}" 2>&1 | tee -a "${A}/advance.log"
+}
+advance
+
 # ---- train (Lightning launches the 4 DDP ranks; DDPGuard checks the process group before the first step)
 WALL=$(qstat -f "${PBS_JOBID:-none}" 2>/dev/null | awk -F' = ' '/Resource_List.walltime/ {print $2}')
 if [[ "${WALL}" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then WALL_S=$(( 10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]} )); else WALL_S=3600; fi
@@ -125,5 +134,6 @@ grep -h "\[ddp-guard\]\|DDPGuard" "${A}/train.log" | head -3
 python "${TOOLS}/runcheck.py" "${RUN_DIR}" --attempt-dir "${A}" --epochs "${EPOCHS}" ${STOP_AT_EPOCH:+--stop-at-epoch "${STOP_AT_EPOCH}"}
 verdict=$?
 if [ "${rc}" -ne 0 ] && [ "${verdict}" -eq 0 ]; then echo "main.py exited ${rc} after reaching its target: failing the job anyway"; verdict=5; fi
+[ "${verdict}" -eq 0 ] && advance  # no-op if the successor was submitted at start; retries a failed early attempt
 echo "==> job verdict ${verdict} $(date -Is)"
 exit "${verdict}"
