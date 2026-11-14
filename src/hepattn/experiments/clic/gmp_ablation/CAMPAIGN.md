@@ -1,9 +1,9 @@
-# GMP ablation campaign: execution, runtime budget and scheduling options
+# GMP ablation campaign: execution, runtime budget and scheduling
 
-Status 2026-11-14: the launcher, the guards, the campaign tool and the spec are implemented. **The queue and scheduling
-strategy are pending the user's decision.** `configs/gmp_ablation/campaigns/ablation_v1.yaml` ships with `queue: null`
-and `walltime: null`, and `campaign.py submit` refuses to submit while either is unset. No campaign job has been
-submitted.
+Status 2026-11-14. Implemented, and the 4-GPU DDP smoke test passed (job 7849183, section 6). The scheduling plan
+recommended below (`capacity`, rolling `afterok` chain, 2 h walltime) awaits the user's approval.
+`configs/gmp_ablation/campaigns/ablation_v1.yaml` keeps `queue`, `walltime` and `chain` null, and `campaign.py submit`
+refuses while any of them is unset. No campaign job has been submitted.
 
 ## 1. Execution setup: one model, 4 GPUs, one run at a time
 
@@ -58,54 +58,100 @@ because the pilot's arms competed for the node's CPUs (the matcher).
 Split into segments, each extra job adds roughly 2 min of start-up plus a recompile (cold ~5 min; probably less with
 the per-run Inductor cache, not measured).
 
-## 4. Scheduling options (the user's decision)
+## 4. Queues for one-node jobs (live `qstat -Qf`, 2026-11-14, and docs.alcf.anl.gov)
 
-Queues that accept a 1-node job (`qstat -Qf`, 2026-11-14):
-
-| queue | nodes | max walltime | relevant limits |
-|---|---|---|---|
-| `debug` | 1–2 | 1 h | 1 running and **1 queued (Q)** job per user |
-| `debug-scaling` | 1–10 | 1 h | 1 queued per user |
-| `preemptable` | 1–10 | 72 h | 20 queued per user; 10 running per project; jobs can be preempted |
-| `prod` → `small` / `backfill-small` | **≥ 10** | 3 h | not usable for a 1-node job (or charges 10 nodes) |
-| `medium` / `large` | ≥ 25 | 6 h+ | not usable |
-| `demand`, `run_next` | — | — | access lists (specific groups/users); not available to us |
-
-| option | preemption risk | wall-clock overhead | reproducibility | operational complexity |
+| queue | nodes | walltime | job limits (live config) | preemption |
 |---|---|---|---|---|
-| **A. `preemptable`, one job per run** (walltime ~1.5 h 2D / ~1.6 h 3D, ~25% margin), whole chain pre-submitted with `afterok` | yes: a preempted job ends the chain; `--resume` restarts the run from its last epoch checkpoint (the interrupted epoch is lost) | lowest: one start-up and one compile per run (~9 min of ~70) | full; a resume restarts at an epoch boundary (optimizer, LR schedule, epoch and sampler seed restored by Lightning; bit-identity across a resume not guaranteed: dataloader workers, non-deterministic kernels) | low: submit once; after a preemption, run `submit --resume` once |
-| **B. `preemptable`, segmented** (e.g. ≤ 4 epochs per job) | same queue, but a preemption costs at most one segment | +2 jobs per run: ~+10–20 min per run | same as A at every segment boundary (by design) | low (same tooling); about 33 jobs instead of 11 |
-| **C. `debug`, segmented** (≤ 6 epochs per job, ~48 min for 3D) | none | +1 job per run (~+9 min), **plus a debug-queue wait before every job** (observed from minutes to about an hour) | as B | **high**: the 1-queued-job limit makes a pre-submitted chain impossible (verified: "would exceed queue generic's per-user limit of jobs in 'Q' state"). Automatic sequencing would need each job to `qsub` its successor from the compute node at the end (not verified to be allowed), and it would occupy the user's only debug slot for days. The debug queue is meant for debugging; a multi-day campaign there may be against ALCF's usage policy (to be checked with ALCF) |
-| **D. ALCF reservation** (support request for 1 node over a time window) | none | none beyond start-up; no queue waits | best | needs ALCF approval; the chain then runs in the reservation queue with the same tooling |
-| E. `prod` with 10 nodes, using 1 | none | — | — | wastes 9 nodes per job; not recommended |
+| **`capacity`** | 1–4 (max 32 nodes in the queue) | up to **168 h** | `max_queued [p:2]`, `max_run [p:1]`: **2 jobs queued-or-running and 1 running PER PROJECT**. The docs say "per user": the live config is stricter, and other members of hgcal-maskformer-fpga share it | **none documented**. Its nodes carry the `prod` tag; the docs list preemption only for `preemptable` ("can be killed at any time if jobs are submitted to the demand queue") |
+| `preemptable` | 1–10 | 72 h | 20 queued per user/project, 10 running per project | yes, by `demand` jobs ("killed without any warning"; `#PBS -r y` makes a job rerunnable) |
+| `debug` | 1–2 | 1 h | 1 running and 1 queued (Q) per user | no |
+| `debug-scaling` | 1–10 | 1 h | 1 queued per user | no |
+| `prod` (`small`, `backfill-*`, ...) | ≥ 10 | — | — | — (1-node jobs impossible) |
+| `demand`, `run_next` | — | — | access lists only | — |
 
-Splitting a run into shorter checkpointed jobs is supported (`epochs_per_job` in the spec): `SegmentStop` ends a job
-at an epoch boundary, and the next job resumes from the last epoch checkpoint with the run's full OneCycle schedule. It
-reduces what a preemption can cost (B) and is the only way to fit 10 epochs into 1-hour queues (C). It does not remove
-C's one-queued-job limit.
+* **Eligibility:** `capacity` has no access list. Our project's jobs are accepted: 7849194 ran and 7849258 was queued.
+  Allocation `hgcal-maskformer-fpga`: 4,256.8 node-hours available until 2027-01-10 (`sbank`).
+* **Not verified:** whether `capacity` jobs can ever be preempted or killed for other reasons; the docs are silent. An
+  ALCF ticket would settle it. Checkpoint/resume (section 6) limits the damage either way.
+* **Queue wait (measured 2026-11-14):** 7849194 waited 17 min (queued 19:47:32, started 20:04:06); its successor
+  7849258, released when 7849194 exited at ~20:04:30, waited **58 min** (started 21:02:20; "Insufficient amount of
+  resource: queue_tags"). The successor does not start until its predecessor has ended, so with a rolling chain such a
+  wait falls between every two runs.
 
-## 5. Proposed sequential order (`ablation_v1`, 10 epochs per run)
+## 5. Sequential scheduling on `capacity`: the rolling `afterok` chain
 
-| # | run | ablation |
+`capacity` holds at most 2 queued-or-running jobs per project, so the full 11-job chain cannot be queued at once
+(`chain: full` stays available for queues that allow it). With **`chain: rolling`**:
+
+1. `campaign.py submit` pins the code (detached worktree of the current clean commit), writes the manifest and queues
+   **only the first unfinished run**.
+2. Each run's job, as soon as its config preflight has passed, calls `campaign.py advance`. That submits the **next
+   unfinished run from the compute node with `-W depend=afterok:<this job>`**. The successor waits in state H while this
+   run trains: 2 campaign jobs in the queue, within the limit.
+3. The run succeeds (verdict 0): PBS releases the successor, which repeats step 2. The run fails (crash, NaN, walltime,
+   kill): PBS deletes the successor unrun and the campaign stops. Nothing is skipped.
+4. `advance` is idempotent (a live successor means no-op; it is called again after a successful verdict as a retry),
+   never resubmits a finished run, and writes the manifest atomically. If its `qsub` is refused (e.g. another member of
+   the project holds the second slot), it writes `STALLED.json` instead of failing the training job. `status` reports
+   the stall, and `campaign.py submit --resume <spec>` continues once the running job has ended.
+
+Verified on Polaris (trivial jobs, no GPU):
+* `qsub` works from a compute node, end to end in `capacity`: job 7849194 ran `/opt/pbs/bin/qsub` on x3004c0s1b0n0
+  and submitted 7849258 with `afterok:7849194` (PBS recorded `beforeok:7849258` on the parent). 7849194 exited 0;
+  7849258 was released and ran at 21:02:20, exit 0.
+* `afterok` after a non-zero exit deletes the dependents unrun: pre-submitted (7848493 → 7848494, 7848495) and
+  in-job submitted (debug: 7849431 ran `qsub` on its compute node for 7849523 with `afterok:7849431`, then exited 1;
+  7849523 ended in state F with no start time and no exit status, never run).
+* Not documented by ALCF either way: whether in-job `qsub` is intended use. It is the standard PBS mechanism and costs
+  nothing while the chain is idle. No login-node daemon or cron is used: the docs say nothing about their policy, and
+  the rolling chain does not need one.
+
+Alternative without in-job submission: one `capacity` job running all 11 runs one after another (≈ 15 h of the 168 h
+limit), still each run in its own process and directory, stopping at the first failure. It is simpler, but it is not one
+PBS job per run, and a 15 h job may wait longer in the queue.
+
+## 6. Smoke test (debug job 7849183, commit 0278d1a): passed
+
+* 352 tests passed (3D GMP, depth wildcard, gmp_track_depth data path, DDPGuard / SegmentStop, campaign, configs,
+  weights-first, a4 placement, data).
+* Two DDP segments of a 2-epoch run (arm g3d_env_dz200_trkany, 100 batches per epoch), on one run directory:
+  * preflight ok; DDPGuard: `DDPStrategy`, world size 4, `all_reduce` = 4, 4 distinct GPU UUIDs, ranks 0-3 on CUDA
+    0-3 of one host; global batch 1024;
+  * segment 1 trained epoch 0, wrote its checkpoint and segments/upto_1.json; segment 2 resumed from that checkpoint,
+    trained epoch 1 and wrote DONE.json; both with 0 non-finite losses and gradients; peak 10.96 GiB;
+  * `resume_check.py`: global step 100 restored; resumed at epoch 1; model state_dict sum, Lion optimizer-state sum and
+    scheduler (last_epoch 100, _step_count 101, total_steps 200, _last_lr) identical to the checkpoint; every logged LR
+    equals one uninterrupted OneCycleLR (max rel diff 0); epochs 0 and 1 each trained once;
+  * metric logging: each attempt wrote its own CSV (99 validation metrics); the summary merges them.
+* Costs measured: a resumed job with a warm per-run Inductor cache spent ~0.4 min on start-up, ~1.5 min of extra
+  first-batch compile and 70 s on its first validation pass.
+
+**Verified by the smoke test:** the DDP configuration and guards, checkpoint save, resume of weights, optimizer,
+scheduler, global step and epoch, LR continuity across a resume, no repeated or skipped epoch, the job verdict and the
+DONE / segment markers, CSV logging across attempts.
+**Not yet verified:** steady validation time per epoch (each smoke job ran a single, compile-including validation pass);
+a full 972-step epoch under this launcher (the step time comes from the bench3 harness); a mid-epoch kill followed by
+`--resume` (by construction it resumes from the last completed epoch, losing the partial one); the rolling chain end to
+end with real runs (its parts are unit-tested and the PBS behaviours verified with trivial jobs).
+
+## 7. Budget: ablation_v1 on `capacity`, rolling chain, 10 epochs per run
+
+| | per run | campaign (11 runs) |
 |---|---|---|
-| 0 | g2d_e020, seed 42 | A: 2D baseline (also C's all-blocks arm) |
-| 1 | g3d_env_dz200, seed 42 | A: 3D, tracks at depth 0 |
-| 2 | g3d_env_dz200_trkany, seed 42 | A: 3D, track–cluster pairs ignore depth |
-| 3–5 | the same three, seed 43 | A: run-to-run spread |
-| 6 | g2d_e010, seed 42 | B: 2D η 0.1 / 64 φ cells |
-| 7 | g2d_e040, seed 42 | B: 2D η 0.4 / 16 φ cells |
-| 8 | g3d_env_dz100, seed 42 | B: 3D, 100 mm depth bins |
-| 9 | g3d_env_dz400, seed 42 | B: 3D, 400 mm depth bins |
-| 10 | g2d_e020_early, seed 42 | C: GMP in block 0 only |
+| compute: one-off (start-up + compile + first validation) | ~7–9 min | |
+| compute: 10 epochs x (training + validation) | 2D 10 x (5.64 + ~0.5) min; 3D 10 x (6.13 + ~0.5) min | |
+| **compute total** | **2D ≈ 70 min, 3D ≈ 75 min** | **≈ 13.4 node-hours = 53.6 GPU-hours** (0.3 % of the allocation's 4,256.8 node-hours) |
+| recommended walltime | **02:00:00** (~1.6x margin; docs: shorter requests gain priority faster) | |
+| queue wait before each run | 17 and 58 min observed (2 samples) | 11 waits ≈ 3–11 h |
+| **wall clock** | | **≈ 13.4 h + 11 waits ≈ 16.5–24 h** if waits stay in the observed range |
 
-## 6. Before the campaign
+Run order (unchanged): track depth (2D, 3D tracks at 0, 3D tracks at any depth) x seeds 42 and 43; then 2D η 0.1 and
+0.4, 3D 100 and 400 mm bins; then GMP in block 0 only. Ten epochs are a screening budget, not convergence.
 
-1. One short DDP smoke test (`submit_gmp_smoke.sh`, one debug job, 2 epochs × 100 batches, the new trkany arm). It runs
-   segment 1, then resumes segment 2 in a second invocation, exercising the preflight, DDPGuard, checkpoint/resume,
-   the verdict and DONE. It also gives a steady validation time. Pending approval.
-2. The torch tests not yet executed (`tests/models/test_gmp3d_wildcard.py`, the data test for `gmp_track_depth`,
-   `tests/experiments/clic/test_gmp_ddp_guard.py`) run in the same debug job.
-3. The user picks the scheduling option; it is set in the spec's `queue`, `walltime` and `epochs_per_job`, committed,
-   and submitted once:
-   `python src/hepattn/experiments/clic/gmp_ablation/campaign.py submit src/hepattn/experiments/clic/configs/gmp_ablation/campaigns/ablation_v1.yaml`;
-   then `... campaign.py status <spec>` at any time.
+## 8. To submit (after approval)
+
+Set in `configs/gmp_ablation/campaigns/ablation_v1.yaml`: `queue: capacity`, `walltime: "02:00:00"`, `chain: rolling`
+(epochs_per_job stays null). Commit, then:
+
+    python src/hepattn/experiments/clic/gmp_ablation/campaign.py submit src/hepattn/experiments/clic/configs/gmp_ablation/campaigns/ablation_v1.yaml
+    python src/hepattn/experiments/clic/gmp_ablation/campaign.py status src/hepattn/experiments/clic/configs/gmp_ablation/campaigns/ablation_v1.yaml
